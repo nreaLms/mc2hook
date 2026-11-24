@@ -72,6 +72,13 @@ freecamUp, freecamDown, freecamIncreaseFOV, freecamDecreaseFOV, activateReplayCa
 
 // MC2 Orbit Camera v0.3 - experimental, offline only.
 namespace {
+    bool shakeEnabled = false;
+    float shakeMinSpeed = 100.0f, shakeMaxSpeed = 280.0f;
+    float shakeIntensity = 0.15f, shakeFrequency = 12.0f, shakeSmoothing = 5.0f;
+    float shakeTime = 0.0f, shakeAmount = 0.0f;
+    const mcCarSim* shakeLastCar = nullptr;
+    bool shakeActive = false;
+    Matrix34 shakeMatrix = Matrix34::I;
     bool orbitEnabled = false;
     float orbitYawSpeed = 180.0f, orbitPitchSpeed = 90.0f;
     float orbitDeadZone = 0.18f, orbitReturnSpeed = 5.0f;
@@ -173,6 +180,51 @@ namespace {
         orbitSafeDistance = OrbitClamp(orbitSafeDistance, 0.0f, allowed);
         orbitMatrix.SetRow(3, pivot + delta * (orbitSafeDistance / distance));
     }
+    void ResetShake() {
+        shakeActive = false;
+        shakeTime = shakeAmount = 0.0f;
+        shakeLastCar = nullptr;
+    }
+    // Rotate a copy of the final camera, leaving its collision-tested position intact.
+    void UpdateShake(const Matrix34& original) {
+        shakeActive = false;
+        if (!shakeEnabled || overrideCameraMtx || mirrorMode ||
+            datTimeManager::SpeedrunMode || mcNetManager::IsNetworkMode) { ResetShake(); return; }
+        mcGameState* state = mcGameState::Instance;
+        if (!state || state->m_CurrentState != GameState::Game || state->m_IsPaused || state->m_IsPausedLocally) { ResetShake(); return; }
+        mcPlayerManager* manager = mcPlayerManager::Instance;
+        if (!manager || manager->m_NumPlayers < 1 || !manager->m_Players[0] || !manager->m_Players[0]->m_Entity) { ResetShake(); return; }
+        mcCarSim* sim = manager->m_Players[0]->m_Entity->m_Car.m_CarSim;
+        if (!sim || !sim->m_Collider || !sim->m_Collider->m_ICS) { ResetShake(); return; }
+        if (sim != shakeLastCar) { ResetShake(); shakeLastCar = sim; }
+        Vector3 pivot = sim->m_Collider->m_ICS->m_WorldTransform.GetRow(3);
+        pivot.Y += 0.75f;
+        float distanceSq = (original.GetRow(3) - pivot).Mag2();
+        if (!(distanceSq > 2.25f && distanceSq < 625.0f)) { ResetShake(); return; }
+        const Vector3& velocity = sim->m_Collider->m_ICS->m_WorldVelocity;
+        float speed = sqrtf(velocity.X * velocity.X + velocity.Z * velocity.Z) * 3.6f;
+        if (!std::isfinite(speed)) { ResetShake(); return; }
+        float dt = OrbitClamp(datTimeManager::GetActualSeconds(), 0.0f, 0.05f);
+        float t = OrbitClamp((speed - shakeMinSpeed) / (shakeMaxSpeed - shakeMinSpeed), 0.0f, 1.0f);
+        t = t * t * (3.0f - 2.0f * t);
+        shakeAmount += (t - shakeAmount) * (1.0f - expf(-shakeSmoothing * dt));
+        shakeTime = fmodf(shakeTime + dt * shakeFrequency * 6.28318530718f, 628.318530718f);
+        if (shakeAmount < 0.0001f) { shakeAmount = 0.0f; return; }
+        shakeMatrix = orbitActive ? orbitMatrix : original;
+        Vector3 position = shakeMatrix.GetRow(3);
+        float amplitude = shakeIntensity * shakeAmount * 0.01745329252f;
+        // Continuous blended waves, no random jumps or position changes.
+        float yaw = amplitude * (0.65f * sinf(shakeTime * 0.73f) + 0.35f * sinf(shakeTime * 1.31f));
+        float pitch = amplitude * (0.65f * sinf(shakeTime) + 0.35f * sinf(shakeTime * 1.57f));
+        Matrix34 rot;
+        rot.MakeRotate(shakeMatrix.GetRow(1), yaw);
+        shakeMatrix.Dot3x3(rot);
+        rot.MakeRotate(shakeMatrix.GetRow(0), pitch);
+        shakeMatrix.Dot3x3(rot);
+        shakeMatrix.SetRow(3, position);
+        shakeActive = true;
+    }
+
     void UpdateOrbit(const Matrix34& original) {
         orbitActive = false;
         static bool inputAttempted = false;
@@ -368,13 +420,16 @@ void FreeCamHandler::SetCameraHook(Matrix34& const origMtx)
     }
     
     UpdateOrbit(origMtx);
+    UpdateShake(origMtx);
     if (overrideCameraMtx) gfxState::SetCamera34(customCameraMtx34);
+    else if (shakeActive) gfxState::SetCamera34(shakeMatrix);
     else if (orbitActive) gfxState::SetCamera34(orbitMatrix);
     else gfxState::SetCamera34(origMtx); // Call original
 }
 void FreeCamHandler::SetCameraOtherHook(Matrix34& const origMtx) // Only set the matrix, no other calculations
 {
     if (overrideCameraMtx) gfxState::SetCamera34(customCameraMtx34);
+    else if (shakeActive) gfxState::SetCamera34(shakeMatrix);
     else if (orbitActive) gfxState::SetCamera34(orbitMatrix);
     else gfxState::SetCamera34(origMtx); // Call original
 }
@@ -493,6 +548,13 @@ void FreeCamHandler::Install()
         orbitCollisionPadding = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "CollisionPadding", 0.10f), 0.0f, 0.5f);
         orbitCollisionRecovery = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "CollisionRecovery", 8.0f), 0.5f, 30.0f);
         orbitMinElevation = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "MinElevation", -10.0f), -75.0f, 30.0f);
+
+        shakeEnabled = HookConfig::GetBool("CameraShake", "EnableCameraShake", false);
+        shakeMinSpeed = OrbitClamp(HookConfig::GetFloat("CameraShake", "MinSpeed", 100.0f), 0.0f, 999.0f);
+        shakeMaxSpeed = OrbitClamp(HookConfig::GetFloat("CameraShake", "MaxSpeed", 280.0f), shakeMinSpeed + 1.0f, 1000.0f);
+        shakeIntensity = OrbitClamp(HookConfig::GetFloat("CameraShake", "Intensity", 0.15f), 0.0f, 3.0f);
+        shakeFrequency = OrbitClamp(HookConfig::GetFloat("CameraShake", "Frequency", 12.0f), 0.1f, 20.0f);
+        shakeSmoothing = OrbitClamp(HookConfig::GetFloat("CameraShake", "Smoothing", 5.0f), 0.1f, 30.0f);
 
         // https://community.bistudio.com/wiki/DIK_KeyCodes
         // Read key mappings from .ini file
