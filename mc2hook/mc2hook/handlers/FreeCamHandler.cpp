@@ -453,6 +453,14 @@ void FreeCamHandler::SetWorldHook(Matrix34& const origMtx)
         customSkyboxCameraMtx34.SetRow(3, customCameraMtx34.GetRow(3));
         gfxState::SetWorld34(customSkyboxCameraMtx34); // Call using custom matrix
     }
+    else if (orbitActive)
+    {
+        // Center skybox and starfield on the effective orbit camera.
+        // Keep native world orientation; the view already contains orbit rotation.
+        customSkyboxCameraMtx34 = origMtx;
+        customSkyboxCameraMtx34.SetRow(3, (shakeActive ? shakeMatrix : orbitMatrix).GetRow(3));
+        gfxState::SetWorld34(customSkyboxCameraMtx34);
+    }
     else gfxState::SetWorld34(origMtx); // Call original
 }
 void FreeCamHandler::AddFrameCameraHook(Matrix34& const a2, bool& const a3)
