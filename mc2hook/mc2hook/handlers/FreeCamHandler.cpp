@@ -79,6 +79,7 @@ namespace {
     const mcCarSim* shakeLastCar = nullptr;
     bool shakeActive = false;
     Matrix34 shakeMatrix = Matrix34::I;
+    Matrix34 shakeBaseMatrix = Matrix34::I;
     bool orbitEnabled = false;
     float orbitYawSpeed = 180.0f, orbitPitchSpeed = 90.0f;
     float orbitDeadZone = 0.18f, orbitReturnSpeed = 5.0f;
@@ -210,7 +211,8 @@ namespace {
         shakeAmount += (t - shakeAmount) * (1.0f - expf(-shakeSmoothing * dt));
         shakeTime = fmodf(shakeTime + dt * shakeFrequency * 6.28318530718f, 628.318530718f);
         if (shakeAmount < 0.0001f) { shakeAmount = 0.0f; return; }
-        shakeMatrix = orbitActive ? orbitMatrix : original;
+        shakeBaseMatrix = orbitActive ? orbitMatrix : original;
+        shakeMatrix = shakeBaseMatrix;
         Vector3 position = shakeMatrix.GetRow(3);
         float amplitude = shakeIntensity * shakeAmount * 0.01745329252f;
         // Continuous blended waves, no random jumps or position changes.
@@ -303,6 +305,16 @@ namespace {
         ApplyOrbitCollision(pivot, sim, dt);
         orbitActive = true;
     }
+}
+
+// Read-only bridge for light trail motion estimation. No renderer state changes.
+// The consumer verifies that the active render camera matches the shaken matrix.
+bool GetLightTrailShakeMatrices(Matrix34& base, Matrix34& shaken)
+{
+    if (!shakeActive || overrideCameraMtx || mirrorMode) return false;
+    base = shakeBaseMatrix;
+    shaken = shakeMatrix;
+    return true;
 }
 
 void FreeCamHandler::SetCameraHook(Matrix34& const origMtx)

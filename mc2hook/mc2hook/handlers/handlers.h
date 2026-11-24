@@ -34,6 +34,8 @@
 #include <handlers/RenderDistanceHandler.h>
 #include <handlers/StateResearchHook.h>
 
+#include <handlers/LightTrailHandler.h>
+
 // Installed before engine init
 static void InstallHandlersPreEngineInit()
 {
@@ -83,5 +85,6 @@ static void InstallMainHandlers()
     InstallHandler<RenderDistanceHandler>("RenderDistance Handler");
     InstallHandler<ShaderHandler>("Shader Handler");
 
+    InstallHandler<LightTrailHandler>("Light Trail Handler");
     //InstallHandler<StateResearchHook>("SRH");
 }
