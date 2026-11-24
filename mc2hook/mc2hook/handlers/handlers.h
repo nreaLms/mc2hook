@@ -35,6 +35,7 @@
 #include <handlers/StateResearchHook.h>
 
 #include <handlers/LightTrailHandler.h>
+#include <handlers/MotionBlurHandler.h>
 
 // Installed before engine init
 static void InstallHandlersPreEngineInit()
@@ -86,5 +87,6 @@ static void InstallMainHandlers()
     InstallHandler<ShaderHandler>("Shader Handler");
 
     InstallHandler<LightTrailHandler>("Light Trail Handler");
+    InstallHandler<MotionBlurHandler>("Motion Blur Handler");
     //InstallHandler<StateResearchHook>("SRH");
 }
