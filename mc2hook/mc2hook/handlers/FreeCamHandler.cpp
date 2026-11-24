@@ -8,6 +8,18 @@
 #include <age/input/mouse.h>
 #include <age/data/timemgr.h>
 #include <dinput.h>
+#include <Xinput.h>
+#include <cmath>
+#include <age/state/gamestate.h>
+#include <age/types.h>
+#include <age/mcgame/playermgr.h>
+#include <age/mcgame/player.h>
+#include <age/vehicle/entity.h>
+#include <mccar/carsim.h>
+#include <age/physics/phcollider.h>
+#include <age/physics/phlevel.h>
+#include <age/physics/phinertia.h>
+#include <age/mcnetwork/netmanager.h>
 
 #include <age/gfx/rstate.h> //
 //#include <age/camera/playercamera.h>
@@ -57,6 +69,189 @@ float cameraNearClip, cameraFarClip;
 // Init controls
 int activateFreecam, freecamLeft, freecamRight, freecamForward, freecamBackward,
 freecamUp, freecamDown, freecamIncreaseFOV, freecamDecreaseFOV, activateReplayCam;
+
+// MC2 Orbit Camera v0.3 - experimental, offline only.
+namespace {
+    bool orbitEnabled = false;
+    float orbitYawSpeed = 180.0f, orbitPitchSpeed = 90.0f;
+    float orbitDeadZone = 0.18f, orbitReturnSpeed = 5.0f;
+    bool orbitInvertY = false;
+    float orbitRecenterDelay = 1.5f;
+    float orbitMoveSpeed = 0.5f; // metres per second
+    float orbitMinElevation = 0.0f; // degrees above the vehicle pivot
+    bool orbitCollision = true;
+    float orbitCollisionRadius = 0.35f;
+    float orbitCollisionPadding = 0.10f;
+    float orbitCollisionRecovery = 8.0f;
+    float orbitSafeDistance = -1.0f;
+    float orbitMovingTime = 0.0f;
+    bool orbitMoving = false;
+    const mcCarSim* orbitLastCar = nullptr;
+    float orbitYaw = 0.0f, orbitPitch = 0.0f;
+    bool orbitActive = false;
+    Matrix34 orbitMatrix = Matrix34::I;
+    typedef DWORD (WINAPI *OrbitGetState)(DWORD, XINPUT_STATE*);
+    OrbitGetState orbitGetState = nullptr;
+
+    float OrbitClamp(float x, float lo, float hi) {
+        return x < lo ? lo : (x > hi ? hi : x);
+    }
+    void ResetOrbit() {
+        orbitYaw = orbitPitch = 0.0f;
+        orbitMovingTime = 0.0f;
+        orbitMoving = false;
+        orbitLastCar = nullptr;
+        orbitSafeDistance = -1.0f;
+        orbitActive = false;
+    }
+    void LoadOrbitInput() {
+        const wchar_t* names[] = {L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll"};
+        wchar_t systemDir[MAX_PATH];
+        UINT len = GetSystemDirectoryW(systemDir, MAX_PATH);
+        if (!len || len >= MAX_PATH - 32) return;
+        for (const wchar_t* name : names) {
+            wchar_t path[MAX_PATH];
+            lstrcpyW(path, systemDir);
+            lstrcatW(path, L"\\");
+            lstrcatW(path, name);
+            HMODULE module = LoadLibraryW(path);
+            if (!module) continue;
+            orbitGetState = reinterpret_cast<OrbitGetState>(GetProcAddress(module, "XInputGetState"));
+            if (orbitGetState) { Printf("Orbit Camera: XInput ready\n"); return; }
+            FreeLibrary(module);
+        }
+        Printf("Orbit Camera: XInput unavailable\n");
+    }
+    float OrbitAxis(SHORT raw) {
+        float v = OrbitClamp(raw / 32767.0f, -1.0f, 1.0f);
+        float a = fabsf(v);
+        if (a <= orbitDeadZone) return 0.0f;
+        return (v < 0.0f ? -1.0f : 1.0f) * (a - orbitDeadZone) / (1.0f - orbitDeadZone);
+    }
+    // Native chase-camera sweep: mc2.exe 0x57A69B calls phLevel vtable +0xB8.
+    // The original caller reads the remaining distance at result +0x20.
+    // ABI and result offsets are inferred from the supplied 32-bit executable.
+    struct OrbitSweepResult {
+        unsigned char prefix[0x20];
+        float remaining;
+        unsigned char suffix[0x40 - 0x24];
+    };
+    static_assert(sizeof(OrbitSweepResult) == 0x40, "Sweep buffer size");
+    typedef bool (__thiscall *OrbitSweep)(phLevel*, Vector3*, Vector3*, float,
+                                         OrbitSweepResult*, int, int, int);
+    void ApplyOrbitCollision(const Vector3& pivot, mcCarSim* sim, float dt) {
+        if (!orbitCollision) { orbitSafeDistance = -1.0f; return; }
+        phLevel* level = phLevel::Instance;
+        if (!level || !sim->m_Collider->m_SomeInstParent) {
+            orbitSafeDistance = -1.0f; return;
+        }
+        Vector3 start = pivot;
+        Vector3 end = orbitMatrix.GetRow(3);
+        Vector3 delta = end - start;
+        float distance = delta.Mag();
+        if (!(distance > 0.001f && distance < 30.0f)) return;
+        // Same player exclusion ID and default mask (0x1F) as camTrackCS.
+        int ignoreId = reinterpret_cast<int>(sim->m_Collider->m_SomeInstParent->m_Archetype);
+        void** vtable = *reinterpret_cast<void***>(level);
+        if (!vtable || !vtable[0xB8 / sizeof(void*)]) return;
+        OrbitSweep sweep = reinterpret_cast<OrbitSweep>(vtable[0xB8 / sizeof(void*)]);
+        OrbitSweepResult hit = {};
+        float allowed = distance;
+        if (sweep(level, &start, &end, orbitCollisionRadius, &hit, ignoreId, 0x1F, 1)) {
+            if (hit.remaining >= 0.0f && hit.remaining <= distance + orbitCollisionRadius) {
+                allowed = OrbitClamp(distance - hit.remaining - orbitCollisionPadding, 0.0f, distance);
+            } else {
+                // An unexpected result must not drive an invalid camera transform.
+                allowed = 0.0f;
+            }
+        }
+        if (orbitSafeDistance < 0.0f || allowed < orbitSafeDistance) {
+            orbitSafeDistance = allowed; // retract immediately, never interpolate through wall
+        } else {
+            orbitSafeDistance += (allowed - orbitSafeDistance) * (1.0f - expf(-orbitCollisionRecovery * dt));
+        }
+        orbitSafeDistance = OrbitClamp(orbitSafeDistance, 0.0f, allowed);
+        orbitMatrix.SetRow(3, pivot + delta * (orbitSafeDistance / distance));
+    }
+    void UpdateOrbit(const Matrix34& original) {
+        orbitActive = false;
+        static bool inputAttempted = false;
+        if (orbitEnabled && !inputAttempted) { inputAttempted = true; LoadOrbitInput(); }
+        if (!orbitEnabled || !orbitGetState || overrideCameraMtx || mirrorMode ||
+            datTimeManager::SpeedrunMode || mcNetManager::IsNetworkMode) { ResetOrbit(); return; }
+        mcGameState* state = mcGameState::Instance;
+        if (!state || state->m_CurrentState != GameState::Game || state->m_IsPaused || state->m_IsPausedLocally) {
+            ResetOrbit(); return;
+        }
+        mcPlayerManager* manager = mcPlayerManager::Instance;
+        if (!manager || manager->m_NumPlayers < 1 || !manager->m_Players[0] || !manager->m_Players[0]->m_Entity) {
+            ResetOrbit(); return;
+        }
+        mcCarSim* sim = manager->m_Players[0]->m_Entity->m_Car.m_CarSim;
+        if (!sim || !sim->m_Collider || !sim->m_Collider->m_ICS) { ResetOrbit(); return; }
+        if (sim != orbitLastCar) { ResetOrbit(); orbitLastCar = sim; }
+        Vector3 pivot = sim->m_Collider->m_ICS->m_WorldTransform.GetRow(3);
+        pivot.Y += 0.75f;
+        Vector3 offset = original.GetRow(3) - pivot;
+        float distanceSq = offset.Mag2();
+        // Skip cockpit, distant cinematics and invalid transforms.
+        if (!(distanceSq > 2.25f && distanceSq < 625.0f)) { ResetOrbit(); return; }
+        XINPUT_STATE input = {};
+        bool found = false;
+        for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
+            if (orbitGetState(i, &input) == ERROR_SUCCESS) { found = true; break; }
+        }
+        float x = found ? OrbitAxis(input.Gamepad.sThumbRX) : 0.0f;
+        float y = found ? OrbitAxis(input.Gamepad.sThumbRY) : 0.0f;
+        const float rad = 0.01745329252f;
+        float dt = OrbitClamp(datTimeManager::GetActualSeconds(), 0.0f, 0.05f);
+        // Require sustained horizontal movement. Hysteresis filters stationary jitter.
+        const Vector3& velocity = sim->m_Collider->m_ICS->m_WorldVelocity;
+        float speedSq = velocity.X * velocity.X + velocity.Z * velocity.Z;
+        float threshold = orbitMoving ? orbitMoveSpeed * 0.6f : orbitMoveSpeed;
+        orbitMoving = speedSq >= threshold * threshold;
+        if (!orbitMoving) orbitMovingTime = 0.0f;
+        else orbitMovingTime = OrbitClamp(orbitMovingTime + dt, 0.0f, orbitRecenterDelay);
+
+        if (x != 0.0f || y != 0.0f) {
+            orbitYaw = remainderf(orbitYaw - x * orbitYawSpeed * rad * dt, 6.28318530718f);
+            orbitPitch -= y * (orbitInvertY ? -1.0f : 1.0f) * orbitPitchSpeed * rad * dt;
+        } else if (orbitMoving && orbitMovingTime >= orbitRecenterDelay) {
+            float decay = expf(-orbitReturnSpeed * dt);
+            orbitYaw *= decay; orbitPitch *= decay;
+        }
+        if (fabsf(orbitYaw) < 0.001f && fabsf(orbitPitch) < 0.001f) {
+            orbitYaw = orbitPitch = 0.0f;
+            orbitSafeDistance = -1.0f;
+            return;
+        }
+        // Positive pitch lowers the radial vector around axis (Z,0,-X).
+        // Bound absolute elevation, not just the relative stick angle.
+        // This is a vehicle-relative floor, not a terrain collision query.
+        float horizontal = sqrtf(offset.X * offset.X + offset.Z * offset.Z);
+        float baseElevation = atan2f(offset.Y, horizontal);
+        float minElevation = orbitMinElevation * rad;
+        float maxElevation = 75.0f * rad;
+        orbitPitch = OrbitClamp(orbitPitch, baseElevation - maxElevation,
+                               baseElevation - minElevation);
+        orbitMatrix = original;
+        orbitMatrix.SetRow(3, offset);
+        orbitMatrix.RotateFullY(orbitYaw);
+        // Horizontal axis perpendicular to the orbit radius, avoids camera roll.
+        Vector3 radial = orbitMatrix.GetRow(3);
+        Vector3 axis(radial.Z, 0.0f, -radial.X);
+        if (axis.Mag2() > 0.001f) {
+            axis.Normalize();
+            Matrix34 rot;
+            rot.MakeRotateUnitAxis(axis, orbitPitch);
+            rot.SetRow(3, Vector3::ORIGIN);
+            orbitMatrix.Dot(rot);
+        }
+        orbitMatrix.SetRow(3, orbitMatrix.GetRow(3) + pivot);
+        ApplyOrbitCollision(pivot, sim, dt);
+        orbitActive = true;
+    }
+}
 
 void FreeCamHandler::SetCameraHook(Matrix34& const origMtx)
 {           
@@ -172,12 +367,15 @@ void FreeCamHandler::SetCameraHook(Matrix34& const origMtx)
         customCameraMtx34.m31 += datTimeManager::GetSeconds() * translateYSpeed * translateMultiplier;
     }
     
+    UpdateOrbit(origMtx);
     if (overrideCameraMtx) gfxState::SetCamera34(customCameraMtx34);
+    else if (orbitActive) gfxState::SetCamera34(orbitMatrix);
     else gfxState::SetCamera34(origMtx); // Call original
 }
 void FreeCamHandler::SetCameraOtherHook(Matrix34& const origMtx) // Only set the matrix, no other calculations
 {
     if (overrideCameraMtx) gfxState::SetCamera34(customCameraMtx34);
+    else if (orbitActive) gfxState::SetCamera34(orbitMatrix);
     else gfxState::SetCamera34(origMtx); // Call original
 }
 void FreeCamHandler::SetWorldHook(Matrix34& const origMtx)
@@ -282,6 +480,20 @@ void FreeCamHandler::Install()
 
     if (enableFreecam)
     {
+        orbitEnabled = HookConfig::GetBool("OrbitCamera", "EnableOrbitCamera", false);
+        orbitYawSpeed = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "HorizontalSpeed", 180.0f), 10.0f, 720.0f);
+        orbitPitchSpeed = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "VerticalSpeed", 90.0f), 0.0f, 360.0f);
+        orbitDeadZone = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "DeadZone", 0.18f), 0.0f, 0.95f);
+        orbitReturnSpeed = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "ReturnSpeed", 5.0f), 0.1f, 20.0f);
+        orbitInvertY = HookConfig::GetBool("OrbitCamera", "InvertY", false);
+        orbitRecenterDelay = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "RecenterDelay", 1.5f), 0.0f, 10.0f);
+        orbitMoveSpeed = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "MoveSpeedThreshold", 0.5f), 0.1f, 10.0f);
+        orbitCollision = HookConfig::GetBool("OrbitCamera", "EnableCollision", true);
+        orbitCollisionRadius = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "CollisionRadius", 0.35f), 0.1f, 1.0f);
+        orbitCollisionPadding = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "CollisionPadding", 0.10f), 0.0f, 0.5f);
+        orbitCollisionRecovery = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "CollisionRecovery", 8.0f), 0.5f, 30.0f);
+        orbitMinElevation = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "MinElevation", -10.0f), -75.0f, 30.0f);
+
         // https://community.bistudio.com/wiki/DIK_KeyCodes
         // Read key mappings from .ini file
         activateFreecam = HookConfig::GetInt("Input Setup", "ActivateFreecam", DIK_F4);
