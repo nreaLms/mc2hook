@@ -1,4 +1,5 @@
 #include "pipeline.h"
+#include <handlers/CursorFixHandler.h>
 
 #include <windows.h>
 #include <dbt.h>
@@ -157,7 +158,13 @@ LRESULT APIENTRY gfxPipeline::gfxWindowProc(HWND hWnd, UINT uMsg, WPARAM wParam,
     //}
     //}
 
-    return $gfxPipeline_gfxWindowProc(hWnd, uMsg, wParam, lParam); // Call original
+    LRESULT result = 0;
+    if (CursorFixHandler::BeforeMessage(hWnd, uMsg, wParam, lParam, result))
+        return result;
+
+    result = $gfxPipeline_gfxWindowProc(hWnd, uMsg, wParam, lParam);
+    CursorFixHandler::AfterMessage(hWnd, uMsg, result);
+    return result;
 }
 
 LRESULT gfxPipeline::InputWindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
