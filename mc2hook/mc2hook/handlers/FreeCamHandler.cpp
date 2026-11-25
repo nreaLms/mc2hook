@@ -1,4 +1,5 @@
 #include "FreecamHandler.h"
+#include "BoostFOVEnvelope.h"
 #include <age/vector/matrix34.h>
 #include <age/vector/matrix44.h>
 #include <age/gfx/rstate.h>
@@ -11,6 +12,8 @@
 #include <Xinput.h>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
+#include <cstring>
 #include <framework/hook_output.h>
 #include <age/state/gamestate.h>
 #include <age/types.h>
@@ -660,8 +663,240 @@ float FreeCamHandler::GetFOVLerpRate(float a, float b, float t) // Regular lerp 
     return a + (b - a) * t;
 }
 
+// Replace only the native boost contribution, not the final projection.
+namespace {
+    bool nativeBoostFovInstalled = false;
+    float nativeBoostAttack = 0.65f;
+    float nativeBoostDecay = 1.85f;
+    constexpr float nativeBoostDecayExponent = 1.85f;
+    float nativeBoostPeakStrength = 0.80f;
+    constexpr float nativeBoostSustain = 0.00f;
+        using NativeFovApproach = int (__cdecl*)(float*, float, float, float);
+
+    // Independent state for each native FOV field (including AI vehicles).
+    // Store addresses as keys only; never dereference a cached address.
+    struct BoostCurveState {
+        float* key = nullptr;
+        float age = 0.0f;
+        float start = 0.0f;
+        float last = 0.0f;
+        bool opening = false;
+        bool retrigger = false;
+    };
+    BoostCurveState boostCurves[128] = {};
+    unsigned boostCurveReplace = 0;
+
+    static BoostCurveState& GetBoostCurve(float* key) {
+        for (auto& state : boostCurves) if (state.key == key) return state;
+        for (auto& state : boostCurves) if (!state.key) {
+            state = BoostCurveState{}; state.key = key; return state;
+        }
+        auto& state = boostCurves[boostCurveReplace++ % 128u];
+        state = BoostCurveState{}; state.key = key; return state;
+    }
+
+    // The native activation tails are reached only after CanActivate succeeds.
+    // Nitro activation decrements the 16-bit charge counter at +0x0e;
+    // SST activation sets its active byte and resets the use timer.
+    static void __fastcall NitroActivated(vehNitro* object, void*) {
+        reinterpret_cast<void (__thiscall*)(vehNitro*)>(0x4D1EF0)(object);
+        if (object && !mcNetManager::IsNetworkMode && !datTimeManager::SpeedrunMode)
+            GetBoostCurve(&object->dword_2c).retrigger = true;
+    }
+    static void __fastcall SSTActivated(mcCarSSTurbo* object, void*) {
+        reinterpret_cast<void (__thiscall*)(mcCarSSTurbo*)>(0x4D4200)(object);
+        if (object && !mcNetManager::IsNetworkMode && !datTimeManager::SpeedrunMode)
+            GetBoostCurve(&object->dword_3c).retrigger = true;
+    }
+
+    static int NativeBoostFovStep(float* value, float target, float rate,
+                                  float dt, uintptr_t amplitudeOffset) {
+        auto original = reinterpret_cast<NativeFovApproach>(0x46A2E0);
+        if (!value || mcNetManager::IsNetworkMode || datTimeManager::SpeedrunMode) {
+            for (auto& state : boostCurves) state = BoostCurveState{};
+            return original(value, target, rate, dt);
+        }
+        float maximum = 0.0f, baseline = 0.0f;
+        std::memcpy(&maximum, reinterpret_cast<const void*>(
+            reinterpret_cast<uintptr_t>(value) - amplitudeOffset), sizeof(maximum));
+        std::memcpy(&baseline, reinterpret_cast<const void*>(
+            reinterpret_cast<uintptr_t>(value) - 4), sizeof(baseline));
+        const float span = maximum - baseline;
+        if (!std::isfinite(maximum) || !std::isfinite(baseline) ||
+            !std::isfinite(span) || span <= 0.0f || !std::isfinite(*value) ||
+            !std::isfinite(dt) || dt < 0.0f ||
+            (target != maximum && target != baseline)) {
+            for (auto& state : boostCurves) if (state.key == value) state = BoostCurveState{};
+            return original(value, target, rate, dt);
+        }
+        auto& state = GetBoostCurve(value);
+        // A real activation restarts the curve even when the native FOV
+        // never visited its baseline between consecutive charges.
+        if (state.retrigger || (target == maximum && !state.opening)) {
+            state.age = 0.0f;
+            state.start = OrbitClamp((*value - baseline) / span, 0.0f, 0.9999f);
+            state.opening = true;
+            state.retrigger = false;
+        }
+        // Short SST boosts must not truncate the common visual impulse.
+        // Continue it through the native closing calls, then settle at zero.
+        if (!state.opening) {
+            const int result = original(value, target, rate, dt);
+            state.last = *value;
+            if (*value == baseline) state = BoostCurveState{};
+            return result;
+        }
+        state.age = OrbitClamp(state.age + dt, 0.0f, nativeBoostAttack + nativeBoostDecay);
+        // Keep the peak just below the native target: the original callers
+        // skip the helper entirely when the field equals that target.
+        const float peak = nativeBoostPeakStrength;
+        float amount;
+        if (state.age < nativeBoostAttack) {
+            const float t = state.age / nativeBoostAttack;
+            const float u = 1.0f - t;
+            amount = state.start + (peak - state.start) * (1.0f - u*u*u);
+        } else {
+            const float t = OrbitClamp((state.age - nativeBoostAttack) / nativeBoostDecay, 0.0f, 1.0f);
+            // Asymmetric ease-in decay: slow just after the peak, faster later.
+            float eased = powf(t, nativeBoostDecayExponent);
+            // Match value and slope at 95%, then settle with zero end slope.
+            constexpr float tailStart = 0.95f;
+            if (t > tailStart) {
+                const float length = 1.0f - tailStart;
+                const float u = (t - tailStart) / length;
+                const float u2 = u * u, u3 = u2 * u;
+                const float y0 = powf(tailStart, nativeBoostDecayExponent);
+                const float m0 = length * nativeBoostDecayExponent *
+                    powf(tailStart, nativeBoostDecayExponent - 1.0f);
+                eased = (2.0f*u3 - 3.0f*u2 + 1.0f)*y0 +
+                    (u3 - 2.0f*u2 + u)*m0 + (-2.0f*u3 + 3.0f*u2);
+            }
+            eased = OrbitClamp(eased, 0.0f, 1.0f);
+            amount = peak + (peak * nativeBoostSustain - peak) * eased;
+        }
+        // Keep the native helper callable while the impulse is in flight.
+        // On a completed inactive boost, restore the exact baseline.
+        const bool finished = state.age >= nativeBoostAttack + nativeBoostDecay;
+        const float floor = target == maximum || !finished ? 0.0001f : 0.0f;
+        const float desired = baseline + span * OrbitClamp(amount, floor, 0.9999f);
+        *value = desired;
+        state.last = *value;
+        if (finished && target == baseline) state = BoostCurveState{};
+        return 0; // Native callers ignore the helper's return value.
+    }
+
+    static int __cdecl NitroFovStep(float* value, float target, float rate, float dt) {
+        return NativeBoostFovStep(value, target, rate, dt, 0x10);
+    }
+    static int __cdecl SSTFovStep(float* value, float target, float rate, float dt) {
+        return NativeBoostFovStep(value, target, rate, dt, 0x14);
+    }
+
+    // Native UpdateSS adds SST (+0x3c) and Nitro (+0x2c) directly.
+    // Match the SST span to the local Nitro span only for that calculation;
+    // leave the native state, its limits, and the shared envelope untouched.
+    static void __fastcall UnifiedBoostUpdateSS(void* camera, void*) {
+        using UpdateSS = void (__thiscall*)(void*);
+        const auto original = reinterpret_cast<UpdateSS>(0x46F140);
+        if (!camera || mcNetManager::IsNetworkMode || datTimeManager::SpeedrunMode) {
+            original(camera); return;
+        }
+        mcGameState* game = mcGameState::Instance;
+        mcPlayerManager* manager = mcPlayerManager::Instance;
+        if (!game || game->m_CurrentState != GameState::Game || !manager ||
+            manager->m_NumPlayers < 1 || !manager->m_Players[0] || !manager->m_Players[0]->m_Entity) {
+            original(camera); return;
+        }
+        mcCarSim* sim = manager->m_Players[0]->m_Entity->m_Car.m_CarSim;
+        mcCarSim* tracked = nullptr;
+        std::memcpy(&tracked, static_cast<const unsigned char*>(camera) + 0xF0, sizeof(tracked));
+        if (!sim || tracked != sim || !sim->m_Nitro || !sim->m_SSTurbo) {
+            original(camera); return;
+        }
+        float nb, sb;
+        std::memcpy(&nb, &sim->m_Nitro->dword_28, sizeof(nb));
+        std::memcpy(&sb, &sim->m_SSTurbo->dword_38, sizeof(sb));
+        const float nr = sim->m_Nitro->m_NitroFOV - nb;
+        const float sr = sim->m_SSTurbo->m_TurboFOV - sb;
+        float& sst = sim->m_SSTurbo->dword_3c;
+        const float saved = sst;
+        if (!std::isfinite(nb) || !std::isfinite(sb) || !std::isfinite(nr) ||
+            !std::isfinite(sr) || !std::isfinite(saved) || nr <= 0.f || sr <= 0.f) {
+            original(camera); return;
+        }
+        const float scaled = sb + nr * OrbitClamp((saved-sb)/sr, 0.f, 1.f);
+        if (!std::isfinite(scaled)) { original(camera); return; }
+        sst = scaled;
+        original(camera);
+        sst = saved;
+    }
+
+    static void InstallNativeBoostFov() {
+        if (!HookConfig::GetBool("BoostCamera", "EnableBoostCamera", false)) return;
+        const float attack = HookConfig::GetFloat("BoostCamera", "AttackTime", 0.65f);
+        const float decay = HookConfig::GetFloat("BoostCamera", "DecayTime", 1.85f);
+        const float peakStrength = HookConfig::GetFloat("BoostCamera", "PeakStrength", 0.80f);
+        if (std::isfinite(peakStrength)) nativeBoostPeakStrength = OrbitClamp(peakStrength, 0.01f, 0.9999f);
+        if (std::isfinite(decay)) nativeBoostDecay = OrbitClamp(decay, 0.03f, 15.0f);
+        if (std::isfinite(attack)) nativeBoostAttack = OrbitClamp(attack, 0.03f, 5.0f);
+        const unsigned char nitroCall[] = {0xE8,0x42,0x80,0xF9,0xFF};
+        const unsigned char sstCall[] = {0xE8,0xE0,0x58,0xF9,0xFF};
+        const unsigned char nitroActivation[] = {0xE9,0x5C,0xFF,0xFF,0xFF};
+        const unsigned char sstActivation[] = {0xE9,0x82,0xFF,0xFF,0xFF};
+        const unsigned char helper[] = {0x8B,0x4C,0x24,0x04,0xD9,0x01,0xD8,0x5C,0x24,0x08};
+        if (reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr)) != 0x400000 ||
+            std::memcmp(reinterpret_cast<const void*>(0x4D1F8F), nitroActivation, sizeof(nitroActivation)) ||
+            std::memcmp(reinterpret_cast<const void*>(0x4D4279), sstActivation, sizeof(sstActivation)) ||
+            std::memcmp(reinterpret_cast<const void*>(0x4D2299), nitroCall, sizeof(nitroCall)) ||
+            std::memcmp(reinterpret_cast<const void*>(0x4D49FB), sstCall, sizeof(sstCall)) ||
+            std::memcmp(reinterpret_cast<const void*>(0x46A2E0), helper, sizeof(helper))) {
+            hook_output("[BoostCamera] Unsupported native FOV signatures; original behavior retained.");
+            return;
+        }
+        InstallCallback("BoostCamera Nitro activation", "Retrigger on charge consumption", &NitroActivated, {cb::jmp(0x4D1F8F)});
+        InstallCallback("BoostCamera SST activation", "Retrigger on SST activation", &SSTActivated, {cb::jmp(0x4D4279)});
+        InstallCallback("BoostCamera Nitro", "Native FOV impulse curve", &NitroFovStep, {cb::call(0x4D2299)});
+        InstallCallback("BoostCamera SST", "Native FOV impulse curve", &SSTFovStep, {cb::call(0x4D49FB)});
+        // The existing native virtual thunk is a five-byte tail jump.
+        const unsigned char updateThunk[] = {0xE9,0xCB,0x11,0x00,0x00};
+        const unsigned char nativeAdd[] = {0xD8,0x40,0x3C,0x8B,0xBF,0xD0,0x01,0x00,0x00,0x85,0xFF,0x74,0x03,0xD8,0x47,0x2C};
+        if (!std::memcmp(reinterpret_cast<const void*>(0x46DF70), updateThunk, sizeof(updateThunk)) &&
+            !std::memcmp(reinterpret_cast<const void*>(0x46F212), nativeAdd, sizeof(nativeAdd))) {
+            InstallCallback("BoostCamera SST match", "Native UpdateSS SST amplitude normalization", &UnifiedBoostUpdateSS, {cb::jmp(0x46DF70)});
+            hook_output("[BoostCamera] SST native camera contribution matched to Nitro.");
+        } else hook_output("[BoostCamera] SST normalization signature mismatch; native amplitudes retained.");
+        nativeBoostFovInstalled = true;
+        hook_output("[BoostCamera] Native Nitro/SST FOV curve: attack=%.3fs decay=%.3fs exponent=%.2f peak=%.2f sustain=%.2f (activation retrigger; full visual duration)", nativeBoostAttack, nativeBoostDecay, nativeBoostDecayExponent, nativeBoostPeakStrength, nativeBoostSustain);
+    }
+}
+
+// Read the actual native contribution of the local player's boost objects.
+// No timer, cached vehicle pointer or additional projection modification.
+bool GetBoostFOVEnvelope(const mcCarSim* sim, float& nitro, float& sst) {
+    nitro = sst = 0.0f;
+    if (!nativeBoostFovInstalled || !sim || mcNetManager::IsNetworkMode ||
+        datTimeManager::SpeedrunMode) return false;
+    auto readWeight = [](const void* object, unsigned offset, unsigned amplitudeOffset, float& out) {
+        if (!object) return true;
+        const auto* ptr = static_cast<const unsigned char*>(object) + offset;
+        float value, baseline, maximum;
+        std::memcpy(&value, ptr, sizeof(value));
+        std::memcpy(&baseline, ptr - 4, sizeof(baseline));
+        std::memcpy(&maximum, ptr - amplitudeOffset, sizeof(maximum));
+        const float range = maximum - baseline;
+        if (!std::isfinite(value) || !std::isfinite(range) || !std::isfinite(baseline)) return false;
+        if (range <= 0.0f) return true; // No native FOV contribution configured.
+        out = OrbitClamp((value - baseline) / range / nativeBoostPeakStrength, 0.0f, 1.0f);
+        if (out < 0.001f) out = 0.0f; // Ignore native helper's tiny positive floor.
+        return true;
+    };
+    return readWeight(sim->m_Nitro, 0x2c, 0x10, nitro) &&
+           readWeight(sim->m_SSTurbo, 0x3c, 0x14, sst);
+}
+
 void FreeCamHandler::Install()
-{    
+{
+    InstallNativeBoostFov();
     bool enableFreecam = HookConfig::GetBool("Freecam", "EnableFreecam", true);
 
     if (enableFreecam)

@@ -19,6 +19,7 @@
 #include <vector>
 #include <cstdint>
 #include "BoostVignette.h"
+#include "BoostFOVEnvelope.h"
 
 class MotionBlurHandler {
     struct TLVertex {
@@ -61,6 +62,9 @@ class MotionBlurHandler {
     static inline UINT s_RTWidth = 0, s_RTHeight = 0;
     static inline D3DFORMAT s_RTFormat = D3DFMT_UNKNOWN;
     static inline float s_BlurAmount = 0.0f;
+    static inline float s_LegacyBlurAmount = 0.0f;
+    static inline float s_BaseBlurAmount = 0.0f;
+    static inline float s_LegacyMaskWeight = 0.0f;
     static inline float s_BoostMaskWeight = 0.0f;
     static inline ULONGLONG s_LastTicks = 0;
 
@@ -83,12 +87,22 @@ class MotionBlurHandler {
     }
 
     static inline bool s_NativeSSTSuppressed = false;
+    static float BoostConfig(const char* key, float def, float lo, float hi) {
+        const float v = HookConfig::GetFloat("BoostBlur", key, def);
+        return std::isfinite(v) ? Clamp(v, lo, hi) : def;
+    }
     static float BoostMultiplier() {
-        static const float value = ConfigF("BoostMultiplier", 1.5f, 1.0f, 3.0f);
-        return value;
+        static const bool enabled = HookConfig::GetBool("BoostBlur", "EnableBoostBlur", true);
+        static const float value = BoostConfig("Multiplier", 3.5f, 1.0f, 5.0f);
+        return enabled ? value : 1.0f;
+    }
+    static float boostFovWeightForBlur(float nitro, float sst) {
+        if (!s_NativeSSTSuppressed) sst = 0.0f;
+        return nitro > sst ? nitro : sst;
     }
     // These are actual activation bytes, not CanActivate() / input requests.
-    static float GetPlayerSpeedKmh(bool& nitroActive, bool& sstActive) {
+    static float GetPlayerSpeedKmh(bool& nitroActive, bool& sstActive, mcCarSim*& playerSim) {
+        playerSim = nullptr;
         nitroActive = sstActive = false;
         mcGameState* state = mcGameState::Instance;
         if (!state || state->m_CurrentState != GameState::Game || state->m_IsPaused || state->m_IsPausedLocally) {
@@ -102,6 +116,7 @@ class MotionBlurHandler {
         if (!sim || !sim->m_Collider || !sim->m_Collider->m_ICS) {
             return 0.0f;
         }
+        playerSim = sim;
         nitroActive = sim->m_Nitro && ((static_cast<unsigned>(sim->m_Nitro->dword_40) & 0xffu) != 0);
         sstActive = sim->m_SSTurbo && ((static_cast<unsigned>(sim->m_SSTurbo->dword_70) & 0xffu) != 0);
         const Vector3& vel = sim->m_Collider->m_ICS->m_WorldVelocity;
@@ -150,7 +165,7 @@ class MotionBlurHandler {
         static const float baseHeight = ConfigF("MaskHeight", 0.20f, 0.06f, 0.34f);
         static const float feather = ConfigF("MaskFalloff", 0.297f, 0.02f, 1.50f);
         // Open-ended rounded rectangle: straight arms, circular lower corners.
-        static const float boostScale = ConfigF("BoostMaskScale", 0.65f, 0.25f, 1.0f);
+        static const float boostScale = BoostConfig("MaskScale", 0.45f, 0.25f, 1.0f);
         const float scale = 1.0f + (boostScale - 1.0f) * s_BoostMaskWeight;
         const float halfW = baseWidth * scale * aspect;
         const float height = baseHeight * scale;
@@ -225,7 +240,7 @@ class MotionBlurHandler {
         if (s_Busy || (!Enabled() && !BoostVignette::Enabled())) return;
         if (datTimeManager::SpeedrunMode || device != gfxState::lpD3DDevice.get()) return;
         auto* game = mcGameState::Instance.get();
-        if (!game || game->m_CurrentState != GameState::Game || game->m_IsPaused || game->m_IsPausedLocally) { s_BlurAmount=0; s_BoostMaskWeight=0; s_LastTicks=0; BoostVignette::Reset(); return; }
+        if (!game || game->m_CurrentState != GameState::Game || game->m_IsPaused || game->m_IsPausedLocally) { s_BlurAmount=0; s_BaseBlurAmount=0; s_LegacyBlurAmount=0; s_LegacyMaskWeight=0; s_BoostMaskWeight=0; s_LastTicks=0; BoostVignette::Reset(); return; }
 
         static const int debugMode = Enabled() ? ConfigI("DebugMode", 0, 0, 3) : 0;
         static const float minSpeed = ConfigF("MinSpeed", 75.0f, 0.0f, 400.0f);
@@ -241,7 +256,12 @@ class MotionBlurHandler {
         s_LastTicks = ticks;
 
         bool nitroActive=false, sstActive=false;
-        const float speed = GetPlayerSpeedKmh(nitroActive, sstActive);
+        mcCarSim* playerSim = nullptr;
+        const float speed = GetPlayerSpeedKmh(nitroActive, sstActive, playerSim);
+        float nitroFov = 0.0f, sstFov = 0.0f;
+        const bool hasFov = GetBoostFOVEnvelope(playerSim, nitroFov, sstFov);
+        const float fovWeight = nitroFov > sstFov ? nitroFov : sstFov;
+        const float blurFovWeight = boostFovWeightForBlur(nitroFov, sstFov);
         constexpr bool debug=false;
         static ULONGLONG lastLog=0;
         if(debug && ticks-lastLog>=2000) { lastLog=ticks; hook_output("[MotionBlur] Speed %.1f km/h, blur %.4f",speed,s_BlurAmount); }
@@ -252,9 +272,19 @@ class MotionBlurHandler {
         const float boostWeight = speedWeight > 0.35f ? speedWeight : 0.35f;
         const float target = Clamp(maxIntensity * (speedWeight + (boosting ? (boost-1.0f)*boostWeight : 0.0f)), 0.0f, 0.20f);
         const float k = 1.0f - std::exp(-smoothing * dt);
-        s_BlurAmount += (target - s_BlurAmount) * k;
-        s_BoostMaskWeight = Saturate(s_BoostMaskWeight + ((boosting ? 1.0f : 0.0f) - s_BoostMaskWeight) * k);
-        const float vignette = preHud ? BoostVignette::Update(nitroActive || sstActive, dt) : 0.0f;
+        s_LegacyBlurAmount += (target - s_LegacyBlurAmount) * k;
+        s_BaseBlurAmount += (maxIntensity * speedWeight - s_BaseBlurAmount) * k;
+        s_LegacyMaskWeight = Saturate(s_LegacyMaskWeight + ((boosting ? 1.0f : 0.0f) - s_LegacyMaskWeight) * k);
+        const float mix = hasFov ? 1.0f : 0.0f;
+        // Cap the peak BEFORE applying the envelope, not the animated result.
+        // This keeps the safety limit without flattening the synchronized peak.
+        const float peakExtra = Clamp(maxIntensity * (boost-1.0f) * boostWeight,
+                                      0.0f, Clamp(0.20f-s_BaseBlurAmount, 0.0f, 0.20f));
+        const float syncedBlur = Clamp(s_BaseBlurAmount + peakExtra * blurFovWeight, 0.0f, 0.20f);
+        s_BlurAmount = s_LegacyBlurAmount + (syncedBlur - s_LegacyBlurAmount) * mix;
+        const float syncedMask = boost > 1.0f ? blurFovWeight : 0.0f;
+        s_BoostMaskWeight = Saturate(s_LegacyMaskWeight + (syncedMask - s_LegacyMaskWeight) * mix);
+        const float vignette = preHud ? BoostVignette::Update(nitroActive || sstActive, dt, hasFov, fovWeight) : 0.0f;
         const bool drawBlur = Enabled() && (debugMode != 0 || s_BlurAmount >= 0.0005f);
         const bool drawVignette = preHud && debugMode == 0 && vignette >= 0.001f;
         if (!drawBlur && !drawVignette) return;
@@ -526,7 +556,7 @@ class MotionBlurHandler {
                         vtbl[17] = reinterpret_cast<void*>(&Hook_Present);
                         VirtualProtect(&vtbl[16], sizeof(void*) * 2, oldProtect, &oldProtect);
                         s_Hooked = true;
-                        hook_output("[MotionBlur] D3D9 Present/Reset hooks installed (v0.2.6 + Boost Vignette v0.1).");
+                        hook_output("[MotionBlur] D3D9 Present/Reset hooks installed (v0.2.8 + Boost Vignette v0.3).");
                         return 0;
                     }
                 }
