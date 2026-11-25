@@ -18,6 +18,7 @@
 #include <cstring>
 #include <vector>
 #include <cstdint>
+#include "BoostVignette.h"
 
 class MotionBlurHandler {
     struct TLVertex {
@@ -221,12 +222,12 @@ class MotionBlurHandler {
     }
 
     static void ApplyBlur(IDirect3DDevice9* device, bool preHud = false) {
-        if (s_Busy || !Enabled()) return;
+        if (s_Busy || (!Enabled() && !BoostVignette::Enabled())) return;
         if (datTimeManager::SpeedrunMode || device != gfxState::lpD3DDevice.get()) return;
         auto* game = mcGameState::Instance.get();
-        if (!game || game->m_CurrentState != GameState::Game || game->m_IsPaused || game->m_IsPausedLocally) { s_BlurAmount=0; return; }
+        if (!game || game->m_CurrentState != GameState::Game || game->m_IsPaused || game->m_IsPausedLocally) { s_BlurAmount=0; s_BoostMaskWeight=0; s_LastTicks=0; BoostVignette::Reset(); return; }
 
-        static const int debugMode = ConfigI("DebugMode", 0, 0, 3);
+        static const int debugMode = Enabled() ? ConfigI("DebugMode", 0, 0, 3) : 0;
         static const float minSpeed = ConfigF("MinSpeed", 75.0f, 0.0f, 400.0f);
         static const float maxSpeed = ConfigF("MaxSpeed", 230.0f, minSpeed + 1.0f, 600.0f);
         static const float maxIntensity = ConfigF("Intensity", 0.050f, 0.0f, 0.20f);
@@ -253,7 +254,11 @@ class MotionBlurHandler {
         const float k = 1.0f - std::exp(-smoothing * dt);
         s_BlurAmount += (target - s_BlurAmount) * k;
         s_BoostMaskWeight = Saturate(s_BoostMaskWeight + ((boosting ? 1.0f : 0.0f) - s_BoostMaskWeight) * k);
-        if (debugMode == 0 && s_BlurAmount < 0.0005f) return;
+        const float vignette = preHud ? BoostVignette::Update(nitroActive || sstActive, dt) : 0.0f;
+        const bool drawBlur = Enabled() && (debugMode != 0 || s_BlurAmount >= 0.0005f);
+        const bool drawVignette = preHud && debugMode == 0 && vignette >= 0.001f;
+        if (!drawBlur && !drawVignette) return;
+        const bool copySource = drawBlur && debugMode != 1;
 
         // In the HUD pass, use its current destination rather than guessing
         // that it is the swap chain. Only full-size targets are eligible.
@@ -279,13 +284,13 @@ class MotionBlurHandler {
                 hook_output("[MotionBlur] %s RT=%ux%u fmt=%u MSAA=%u",preHud?"PreHUD":"Present",desc.Width,desc.Height,(unsigned)desc.Format,(unsigned)desc.MultiSampleType);
             }
         }
-        if (debugMode != 1 && desc.Format != D3DFMT_A8R8G8B8 && desc.Format != D3DFMT_X8R8G8B8) {
+        if (copySource && desc.Format != D3DFMT_A8R8G8B8 && desc.Format != D3DFMT_X8R8G8B8) {
             Report("Unsupported render target format",(HRESULT)desc.Format);
             backBuffer->Release();
             return;
         }
-        if(debugMode != 1) EnsureResources(device, desc.Width, desc.Height, desc.Format);
-        if (debugMode != 1 && !s_SourceSurface) { Report("Source allocation failed",E_FAIL); backBuffer->Release(); return; }
+        if(copySource) EnsureResources(device, desc.Width, desc.Height, desc.Format);
+        if (copySource && !s_SourceSurface) { Report("Source allocation failed",E_FAIL); backBuffer->Release(); return; }
 
         HRESULT hr=S_OK;
         SceneResume resume{device};
@@ -320,7 +325,7 @@ class MotionBlurHandler {
         if(!safe) { Report("MRT configuration skipped",E_FAIL); if(oldDepth) oldDepth->Release(); oldRT->Release(); stateBlock->Release(); backBuffer->Release(); return; }
         // Save attachments and states before splitting the active game scene.
         // The red diagnostic needs no texture copy and can stay inside it.
-        if (preHud && debugMode != 1) {
+        if (preHud && copySource) {
             hr=device->EndScene();
             if (FAILED(hr)) {
                 Report("PreHUD EndScene",hr);
@@ -328,7 +333,7 @@ class MotionBlurHandler {
             }
             resume.pending=true;
         }
-        if (debugMode != 1) {
+        if (copySource) {
             hr=device->StretchRect(backBuffer,nullptr,s_SourceSurface,nullptr,D3DTEXF_NONE);
             if(FAILED(hr)) {
                 Report(preHud?"PreHUD StretchRect":"Present StretchRect",hr);
@@ -341,7 +346,7 @@ class MotionBlurHandler {
         MB_SET(SetDepthStencilSurface(nullptr));
         MB_SET(SetRenderTarget(0,backBuffer));
         bool began=false;
-        if(ready && !(preHud && debugMode==1)) { hr=device->BeginScene(); began=SUCCEEDED(hr); if(!began) { Report("Blur BeginScene",hr); ready=false; } }
+        if(ready && (!preHud || copySource)) { hr=device->BeginScene(); began=SUCCEEDED(hr); if(!began) { Report("Blur BeginScene",hr); ready=false; } }
         MB_SET(SetVertexShader(nullptr));
         MB_SET(SetPixelShader(nullptr));
         MB_SET(SetRenderState(D3DRS_STENCILENABLE,FALSE));
@@ -354,7 +359,7 @@ class MotionBlurHandler {
         D3DVIEWPORT9 viewport = {0,0,desc.Width,desc.Height,0.0f,1.0f};
         MB_SET(SetViewport(&viewport));
         MB_SET(SetRenderState(D3DRS_CLIPPLANEENABLE,0));
-        MB_SET(SetTexture(0, debugMode == 1 ? nullptr : s_SourceTexture));
+        MB_SET(SetTexture(0, copySource ? s_SourceTexture : nullptr));
         MB_SET(SetTextureStageState(0,D3DTSS_TEXCOORDINDEX,0));
         MB_SET(SetTextureStageState(0,D3DTSS_TEXTURETRANSFORMFLAGS,D3DTTFF_DISABLE));
         MB_SET(SetFVF(FVF));
@@ -383,7 +388,7 @@ class MotionBlurHandler {
         MB_SET(SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR));
         MB_SET(SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE));
 
-        const int passes = (debugMode == 1 || debugMode == 2) ? 1 : samples;
+        const int passes = !drawBlur ? 0 : ((debugMode == 1 || debugMode == 2) ? 1 : samples);
         unsigned submitted=0;
         for (int i = 0; ready && i < passes; ++i) {
             const float t = (float(i) + 0.5f) / float(samples);
@@ -402,6 +407,24 @@ class MotionBlurHandler {
             }
         }
 
+        if (ready && drawVignette) {
+            MB_SET(SetTexture(0, nullptr));
+            MB_SET(SetTextureStageState(0,D3DTSS_COLOROP,D3DTOP_SELECTARG2));
+            MB_SET(SetTextureStageState(0,D3DTSS_ALPHAOP,D3DTOP_SELECTARG2));
+            // Reuse the established screen-space mesh, replacing only its vertex colors.
+            BuildGrid(verts, inds, desc.Width, desc.Height, 1.0f, 1.0f, false);
+            for (auto& v : verts) {
+                const float x = (v.x + .5f) / float(desc.Width);
+                const float y = (v.y + .5f) / float(desc.Height);
+                const DWORD a = DWORD(BoostVignette::Alpha(x,y,vignette)*255.f+.5f);
+                v.color = D3DCOLOR_ARGB(a,0,0,0);
+            }
+            if (ready) {
+                hr = device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST,0,(UINT)verts.size(),
+                    (UINT)inds.size()/3,inds.data(),D3DFMT_INDEX16,verts.data(),sizeof(TLVertex));
+                if (FAILED(hr)) Report("BoostVignette draw",hr); else ++submitted;
+            }
+        }
         if(debugMode || debug) { static ULONGLONG lastDraw=0; if(!lastDraw || ticks-lastDraw>=2000) { lastDraw=ticks; hook_output("[MotionBlur] %s mode=%d submitted=%u/%d RT=%ux%u",preHud?"PreHUD":"Present",debugMode,submitted,passes,desc.Width,desc.Height); } }
         #undef MB_SET
         if(began) { hr=device->EndScene(); if(FAILED(hr)) Report("Present EndScene",hr); }
@@ -482,13 +505,15 @@ class MotionBlurHandler {
 
     static HRESULT WINAPI Hook_Reset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* params) {
         ReleaseResources();
+        BoostVignette::Reset();
+        s_LastTicks=0;
         s_PreHudDrawn=s_PreHudTried=false;
         return s_OriginalReset ? s_OriginalReset(device, params) : D3D_OK;
     }
 
     static DWORD WINAPI HookThread(LPVOID) {
         for (;;) {
-            if (s_Hooked || !Enabled()) return 0;
+            if (s_Hooked || (!Enabled() && !BoostVignette::Enabled())) return 0;
             IDirect3DDevice9* device = gfxState::lpD3DDevice;
             if (device) {
                 void** vtbl = *reinterpret_cast<void***>(device);
@@ -501,7 +526,7 @@ class MotionBlurHandler {
                         vtbl[17] = reinterpret_cast<void*>(&Hook_Present);
                         VirtualProtect(&vtbl[16], sizeof(void*) * 2, oldProtect, &oldProtect);
                         s_Hooked = true;
-                        hook_output("[MotionBlur] D3D9 Present/Reset hooks installed (v0.2.6).");
+                        hook_output("[MotionBlur] D3D9 Present/Reset hooks installed (v0.2.6 + Boost Vignette v0.1).");
                         return 0;
                     }
                 }
@@ -512,10 +537,10 @@ class MotionBlurHandler {
 
 public:
     static void Install() {
-        if (!Enabled()) return;
+        if (!Enabled() && !BoostVignette::Enabled()) return;
         if (s_Thread) return;
         InstallPreHud();
-        SuppressNativeSSTBlur();
+        if (Enabled()) SuppressNativeSSTBlur();
         s_Thread = CreateThread(nullptr, 0, &HookThread, nullptr, 0, nullptr);
         if (s_Thread) {
             CloseHandle(s_Thread);
