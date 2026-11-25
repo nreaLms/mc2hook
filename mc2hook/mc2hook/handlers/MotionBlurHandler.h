@@ -7,6 +7,8 @@
 #include <age/mcgame/player.h>
 #include <age/vehicle/entity.h>
 #include <mccar/carsim.h>
+#include <age/vehicle/nitro.h>
+#include <age/vehicle/carSSTurbo.h>
 #include <age/physics/phcollider.h>
 #include <age/physics/phinertia.h>
 #include <age/gfx/rstate.h>
@@ -58,6 +60,7 @@ class MotionBlurHandler {
     static inline UINT s_RTWidth = 0, s_RTHeight = 0;
     static inline D3DFORMAT s_RTFormat = D3DFMT_UNKNOWN;
     static inline float s_BlurAmount = 0.0f;
+    static inline float s_BoostMaskWeight = 0.0f;
     static inline ULONGLONG s_LastTicks = 0;
 
     static float Clamp(float x, float lo, float hi) {
@@ -78,7 +81,14 @@ class MotionBlurHandler {
         return v < lo ? lo : (v > hi ? hi : v);
     }
 
-    static float GetPlayerSpeedKmh() {
+    static inline bool s_NativeSSTSuppressed = false;
+    static float BoostMultiplier() {
+        static const float value = ConfigF("BoostMultiplier", 1.5f, 1.0f, 3.0f);
+        return value;
+    }
+    // These are actual activation bytes, not CanActivate() / input requests.
+    static float GetPlayerSpeedKmh(bool& nitroActive, bool& sstActive) {
+        nitroActive = sstActive = false;
         mcGameState* state = mcGameState::Instance;
         if (!state || state->m_CurrentState != GameState::Game || state->m_IsPaused || state->m_IsPausedLocally) {
             return 0.0f;
@@ -91,6 +101,8 @@ class MotionBlurHandler {
         if (!sim || !sim->m_Collider || !sim->m_Collider->m_ICS) {
             return 0.0f;
         }
+        nitroActive = sim->m_Nitro && ((static_cast<unsigned>(sim->m_Nitro->dword_40) & 0xffu) != 0);
+        sstActive = sim->m_SSTurbo && ((static_cast<unsigned>(sim->m_SSTurbo->dword_70) & 0xffu) != 0);
         const Vector3& vel = sim->m_Collider->m_ICS->m_WorldVelocity;
         const float speedMs = std::sqrt(vel.X * vel.X + vel.Y * vel.Y + vel.Z * vel.Z);
         return speedMs * 3.6f;
@@ -132,12 +144,15 @@ class MotionBlurHandler {
     // Rounded U in screen-height units: one distance field and one feather.
     static float MaskAlphaUShaped(float fx, float fy, float aspect) {
         constexpr float cx = 0.50f;
-        static const float width = ConfigF("MaskWidth", 0.24f, 0.08f, 0.40f);
+        static const float baseWidth = ConfigF("MaskWidth", 0.24f, 0.08f, 0.40f);
         static const float bottom = ConfigF("MaskBottomBias", 0.48f, 0.35f, 0.92f);
-        static const float height = ConfigF("MaskHeight", 0.20f, 0.06f, 0.34f);
+        static const float baseHeight = ConfigF("MaskHeight", 0.20f, 0.06f, 0.34f);
         static const float feather = ConfigF("MaskFalloff", 0.297f, 0.02f, 1.50f);
         // Open-ended rounded rectangle: straight arms, circular lower corners.
-        const float halfW = width * aspect;
+        static const float boostScale = ConfigF("BoostMaskScale", 0.65f, 0.25f, 1.0f);
+        const float scale = 1.0f + (boostScale - 1.0f) * s_BoostMaskWeight;
+        const float halfW = baseWidth * scale * aspect;
+        const float height = baseHeight * scale;
         const float radius = height < halfW ? height : halfW;
         const float qx = std::fabs(fx-cx)*aspect - (halfW-radius);
         const float qy = fy-bottom;
@@ -224,13 +239,20 @@ class MotionBlurHandler {
         if (s_LastTicks && ticks > s_LastTicks) dt = Clamp(float(ticks - s_LastTicks) * 0.001f, 0.0f, 0.05f);
         s_LastTicks = ticks;
 
-        const float speed = GetPlayerSpeedKmh();
+        bool nitroActive=false, sstActive=false;
+        const float speed = GetPlayerSpeedKmh(nitroActive, sstActive);
         constexpr bool debug=false;
         static ULONGLONG lastLog=0;
         if(debug && ticks-lastLog>=2000) { lastLog=ticks; hook_output("[MotionBlur] Speed %.1f km/h, blur %.4f",speed,s_BlurAmount); }
-        const float target = maxIntensity * std::pow(Saturate((speed - minSpeed) / (maxSpeed - minSpeed)), speedCurve);
+        const float speedWeight = std::pow(Saturate((speed - minSpeed) / (maxSpeed - minSpeed)), speedCurve);
+        const float boost = BoostMultiplier();
+        const bool boosting = boost > 1.0f && (nitroActive || (sstActive && s_NativeSSTSuppressed));
+        // A small floor ensures the boost is visible even below MinSpeed.
+        const float boostWeight = speedWeight > 0.35f ? speedWeight : 0.35f;
+        const float target = Clamp(maxIntensity * (speedWeight + (boosting ? (boost-1.0f)*boostWeight : 0.0f)), 0.0f, 0.20f);
         const float k = 1.0f - std::exp(-smoothing * dt);
         s_BlurAmount += (target - s_BlurAmount) * k;
+        s_BoostMaskWeight = Saturate(s_BoostMaskWeight + ((boosting ? 1.0f : 0.0f) - s_BoostMaskWeight) * k);
         if (debugMode == 0 && s_BlurAmount < 0.0005f) return;
 
         // In the HUD pass, use its current destination rather than guessing
@@ -403,13 +425,40 @@ class MotionBlurHandler {
             s_PreHudTried=true;
             static ULONGLONG last=0;
             const auto now=GetTickCount64();
-            static const int debugMode = ConfigI("DebugMode", 0, 0, 3);
-            if (debugMode != 0 && (!last || now-last>=2000)) { last=now; hook_output("[MotionBlur] PreHUD common setup reached (0x4996C3)."); }
+            if (!last || now-last>=2000) { last=now; hook_output("[MotionBlur] PreHUD common setup reached (0x4996C3)."); }
             auto* device=gfxState::lpD3DDevice.get();
             if (device) ApplyBlur(device,true);
         }
         // Let the engine establish its own HUD render state after our pass.
         reinterpret_cast<void (__cdecl*)()>(0x5EE9F0)();
+    }
+
+    // SST writes 1 - its blur envelope into the per-view TurboBlurX amount.
+    // Replace only those two subtractions with ST(0)-ST(0); preserve the x87
+    // stack, original stores, boost physics, FOV, and unrelated blur flags.
+    static void SuppressNativeSSTBlur() {
+        if (!s_PreHudInstalled || BoostMultiplier() <= 1.0f) return;
+        if (reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr)) != 0x400000) return;
+        auto* a = reinterpret_cast<unsigned char*>(0x4D479A);
+        auto* b = reinterpret_cast<unsigned char*>(0x4D49CF);
+        const unsigned char expectedA[] = {0xD8,0x64,0x24,0x14,0xD9,0x1C,0x82};
+        const unsigned char expectedB[] = {0xD8,0xE1,0xD9,0x1C,0x82,0xDD,0xD8};
+        if (std::memcmp(a,expectedA,sizeof(expectedA)) || std::memcmp(b,expectedB,sizeof(expectedB))) {
+            hook_output("[MotionBlur] Native SST signature mismatch; native SST blur retained."); return;
+        }
+        DWORD oldProtect=0;
+        auto* page=reinterpret_cast<void*>(0x4D4000);
+        if (!VirtualProtect(page,0x1000,PAGE_EXECUTE_READWRITE,&oldProtect)) {
+            hook_output("[MotionBlur] Native SST patch unavailable; native SST blur retained."); return;
+        }
+        const unsigned char patchA[]={0xD8,0xE0,0x90,0x90};
+        const unsigned char patchB[]={0xD8,0xE0};
+        std::memcpy(a,patchA,sizeof(patchA));
+        std::memcpy(b,patchB,sizeof(patchB));
+        FlushInstructionCache(GetCurrentProcess(),page,0x1000);
+        DWORD ignored=0; VirtualProtect(page,0x1000,oldProtect,&ignored);
+        s_NativeSSTSuppressed=true;
+        hook_output("[MotionBlur] Native SST blur replaced; Nitro and SST boost weighting enabled.");
     }
 
     static void InstallPreHud() {
@@ -452,7 +501,7 @@ class MotionBlurHandler {
                         vtbl[17] = reinterpret_cast<void*>(&Hook_Present);
                         VirtualProtect(&vtbl[16], sizeof(void*) * 2, oldProtect, &oldProtect);
                         s_Hooked = true;
-                        hook_output("[MotionBlur] D3D9 Present/Reset hooks installed (v0.2.4).");
+                        hook_output("[MotionBlur] D3D9 Present/Reset hooks installed (v0.2.6).");
                         return 0;
                     }
                 }
@@ -466,6 +515,7 @@ public:
         if (!Enabled()) return;
         if (s_Thread) return;
         InstallPreHud();
+        SuppressNativeSSTBlur();
         s_Thread = CreateThread(nullptr, 0, &HookThread, nullptr, 0, nullptr);
         if (s_Thread) {
             CloseHandle(s_Thread);

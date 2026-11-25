@@ -18,6 +18,8 @@
 #include <age/mcgame/player.h>
 #include <age/vehicle/entity.h>
 #include <mccar/carsim.h>
+#include <age/vehicle/nitro.h>
+#include <age/vehicle/carSSTurbo.h>
 #include <veh_dyna/wheel.h>
 #include <age/physics/phcollider.h>
 #include <age/physics/phlevel.h>
@@ -80,6 +82,9 @@ namespace {
     float landingAir = 0.0f, landingDown = 0.0f;
     float landingAge = 0.0f, landingStrength = 0.0f;
     bool landingWasGrounded = false, landingReady = false;
+    bool boostShakeEnabled = false, boostWasActive = false;
+    float boostIntensity = 1.0f, boostKickIntensity = 2.5f, boostKickDuration = 0.30f;
+    float boostShakeWeight = 0.0f, boostKickAge = 1.0f, boostShakeTime = 0.0f;
     bool shakeEnabled = false;
     float shakeMinSpeed = 100.0f, shakeMaxSpeed = 280.0f;
     float shakeIntensity = 0.15f, shakeFrequency = 12.0f, shakeSmoothing = 5.0f;
@@ -209,6 +214,9 @@ namespace {
         shakeActive = false;
         shakeTime = shakeAmount = 0.0f;
         shakeLastCar = nullptr;
+        boostWasActive = false;
+        boostShakeWeight = boostShakeTime = 0.0f;
+        boostKickAge = boostKickDuration;
         landingAir = landingDown = landingAge = landingStrength = 0.0f;
         landingWasGrounded = landingReady = false;
     }
@@ -266,7 +274,7 @@ namespace {
     // Rotate a copy of the final camera, leaving its collision-tested position intact.
     void UpdateShake(const Matrix34& original) {
         shakeActive = false;
-        if ((!shakeEnabled && !landingEnabled) || overrideCameraMtx || mirrorMode ||
+        if ((!shakeEnabled && !landingEnabled && !boostShakeEnabled) || overrideCameraMtx || mirrorMode ||
             datTimeManager::SpeedrunMode || mcNetManager::IsNetworkMode) { LandingDiagnostic("mode blocked"); ResetShake(); return; }
         mcGameState* state = mcGameState::Instance;
         if (!state || state->m_CurrentState != GameState::Game || state->m_IsPaused || state->m_IsPausedLocally) { LandingDiagnostic("game state blocked"); ResetShake(); return; }
@@ -297,14 +305,30 @@ namespace {
         shakeAmount += (t - shakeAmount) * (1.0f - expf(-shakeSmoothing * dt));
         shakeTime = fmodf(shakeTime + dt * shakeFrequency * 6.28318530718f, 628.318530718f);
         if (shakeAmount < 0.0001f) shakeAmount = 0.0f;
-        if (shakeAmount == 0.0f && fabsf(landingPitch) < 0.000001f) return;
+        float boostYaw = 0.0f, boostPitch = 0.0f;
+        if (boostShakeEnabled) {
+            const bool active = !orbitActive && ((sim->m_Nitro && ((static_cast<unsigned>(sim->m_Nitro->dword_40) & 0xffu) != 0)) ||
+                (sim->m_SSTurbo && ((static_cast<unsigned>(sim->m_SSTurbo->dword_70) & 0xffu) != 0)));
+            if (active && !boostWasActive && boostKickAge >= boostKickDuration) boostKickAge = 0.0f;
+            boostWasActive = active;
+            boostShakeWeight += ((active ? 1.0f : 0.0f) - boostShakeWeight) * (1.0f - expf(-(active ? 14.0f : 7.0f) * dt));
+            if (boostShakeWeight < 0.0001f) boostShakeWeight = 0.0f;
+            boostKickAge = OrbitClamp(boostKickAge + dt, 0.0f, boostKickDuration);
+            const float kickT = boostKickAge / boostKickDuration;
+            const float kick = kickT < 1.0f ? boostKickIntensity * sinf(3.14159265f * kickT) * sinf(3.14159265f * kickT) : 0.0f;
+            boostShakeTime = fmodf(boostShakeTime + dt * 6.28318530718f, 6.28318530718f);
+            const float amp = (boostIntensity * boostShakeWeight + kick) * 0.01745329252f;
+            boostYaw = amp * (0.55f * sinf(boostShakeTime * 11.0f) + 0.30f * sinf(boostShakeTime * 7.0f));
+            boostPitch = amp * (0.65f * sinf(boostShakeTime * 13.0f) + 0.35f * sinf(boostShakeTime * 9.0f));
+        }
+        if (shakeAmount == 0.0f && fabsf(landingPitch) < 0.000001f && fabsf(boostYaw) < 0.000001f && fabsf(boostPitch) < 0.000001f) return;
         shakeBaseMatrix = orbitActive ? orbitMatrix : original;
         shakeMatrix = shakeBaseMatrix;
         Vector3 position = shakeMatrix.GetRow(3);
         float amplitude = shakeIntensity * shakeAmount * 0.01745329252f;
         // Continuous blended waves, no random jumps or position changes.
-        float yaw = amplitude * (0.65f * sinf(shakeTime * 0.73f) + 0.35f * sinf(shakeTime * 1.31f));
-        float pitch = amplitude * (0.65f * sinf(shakeTime) + 0.35f * sinf(shakeTime * 1.57f)) + landingPitch;
+        float yaw = amplitude * (0.65f * sinf(shakeTime * 0.73f) + 0.35f * sinf(shakeTime * 1.31f)) + boostYaw;
+        float pitch = amplitude * (0.65f * sinf(shakeTime) + 0.35f * sinf(shakeTime * 1.57f)) + landingPitch + boostPitch;
         Matrix34 rot;
         rot.MakeRotate(shakeMatrix.GetRow(1), yaw);
         shakeMatrix.Dot3x3(rot);
@@ -662,6 +686,14 @@ void FreeCamHandler::Install()
         landingIntensity = OrbitClamp(HookConfig::GetFloat("LandingShake", "Intensity", 0.8f), 0.0f, 5.0f);
         landingDuration = OrbitClamp(HookConfig::GetFloat("LandingShake", "Duration", 0.24f), 0.10f, 0.80f);
         hook_output("[LandingShake] v0.5.2b enabled=%d debug=%d intensity=%.2f duration=%.2f", int(landingEnabled), int(landingDebug), landingIntensity, landingDuration);
+        boostShakeEnabled = HookConfig::GetBool("BoostShake", "EnableBoostShake", false);
+        boostIntensity = HookConfig::GetFloat("BoostShake", "Intensity", 1.0f);
+        boostKickIntensity = HookConfig::GetFloat("BoostShake", "KickIntensity", 2.5f);
+        boostKickDuration = HookConfig::GetFloat("BoostShake", "KickDuration", 0.30f);
+        boostIntensity = std::isfinite(boostIntensity) ? OrbitClamp(boostIntensity, 0.0f, 3.0f) : 1.0f;
+        boostKickIntensity = std::isfinite(boostKickIntensity) ? OrbitClamp(boostKickIntensity, 0.0f, 5.0f) : 2.5f;
+        boostKickDuration = std::isfinite(boostKickDuration) ? OrbitClamp(boostKickDuration, 0.10f, 1.0f) : 0.30f;
+        boostKickAge = boostKickDuration;
         shakeEnabled = HookConfig::GetBool("CameraShake", "EnableCameraShake", false);
         shakeMinSpeed = OrbitClamp(HookConfig::GetFloat("CameraShake", "MinSpeed", 100.0f), 0.0f, 999.0f);
         shakeMaxSpeed = OrbitClamp(HookConfig::GetFloat("CameraShake", "MaxSpeed", 280.0f), shakeMinSpeed + 1.0f, 1000.0f);
