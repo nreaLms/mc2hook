@@ -403,7 +403,8 @@ class MotionBlurHandler {
             s_PreHudTried=true;
             static ULONGLONG last=0;
             const auto now=GetTickCount64();
-            if (!last || now-last>=2000) { last=now; hook_output("[MotionBlur] PreHUD common setup reached (0x4996C3)."); }
+            static const int debugMode = ConfigI("DebugMode", 0, 0, 3);
+            if (debugMode != 0 && (!last || now-last>=2000)) { last=now; hook_output("[MotionBlur] PreHUD common setup reached (0x4996C3)."); }
             auto* device=gfxState::lpD3DDevice.get();
             if (device) ApplyBlur(device,true);
         }
