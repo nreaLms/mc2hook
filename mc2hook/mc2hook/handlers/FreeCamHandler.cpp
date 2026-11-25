@@ -140,7 +140,9 @@ namespace {
     // The original caller reads the remaining distance at result +0x20.
     // ABI and result offsets are inferred from the supplied 32-bit executable.
     struct OrbitSweepResult {
-        unsigned char prefix[0x20];
+        unsigned char prefix[0x04];
+        float normalX, normalY, normalZ; // Native caller reads result +0x04..0x0C.
+        unsigned char middle[0x10];
         float remaining;
         unsigned char suffix[0x40 - 0x24];
     };
@@ -166,11 +168,17 @@ namespace {
         OrbitSweepResult hit = {};
         float allowed = distance;
         if (sweep(level, &start, &end, orbitCollisionRadius, &hit, ignoreId, 0x1F, 1)) {
-            if (hit.remaining >= 0.0f && hit.remaining <= distance + orbitCollisionRadius) {
+            // Match camTrackCS at 0x57A6A9: accept only a normal opposing
+            // the normalized sweep direction (native threshold -0.00001f).
+            const float normalDot = (hit.normalX * delta.X + hit.normalY * delta.Y +
+                                     hit.normalZ * delta.Z) / distance;
+            // The native caller accepts only a hit fraction strictly between 0 and 1.
+            // Reject exit faces and invalid/initial-overlap distances rather than
+            // collapsing the camera onto the pivot.
+            if (std::isfinite(normalDot) && normalDot < -0.00001f &&
+                std::isfinite(hit.remaining) && hit.remaining > 0.0f &&
+                hit.remaining < distance) {
                 allowed = OrbitClamp(distance - hit.remaining - orbitCollisionPadding, 0.0f, distance);
-            } else {
-                // An unexpected result must not drive an invalid camera transform.
-                allowed = 0.0f;
             }
         }
         if (orbitSafeDistance < 0.0f || allowed < orbitSafeDistance) {
