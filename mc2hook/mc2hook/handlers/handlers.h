@@ -36,6 +36,8 @@
 
 #include <handlers/LightTrailHandler.h>
 #include <handlers/MotionBlurHandler.h>
+#include <handlers/QuickLaunchHandler.h>
+#include <handlers/TrafficDiagnosticsHandler.h>
 
 // Installed before engine init
 static void InstallHandlersPreEngineInit()
@@ -88,5 +90,7 @@ static void InstallMainHandlers()
 
     InstallHandler<LightTrailHandler>("Light Trail Handler");
     InstallHandler<MotionBlurHandler>("Motion Blur Handler");
+    InstallHandler<QuickLaunchHandler>("Quick Launch Handler");
+    InstallHandler<TrafficDiagnosticsHandler>("Traffic Diagnostics Handler");
     //InstallHandler<StateResearchHook>("SRH");
 }
