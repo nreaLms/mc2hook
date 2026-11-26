@@ -25,7 +25,6 @@
 #include <age/vehicle/carSSTurbo.h>
 #include <veh_dyna/wheel.h>
 #include <age/physics/phcollider.h>
-#include <age/physics/phlevel.h>
 #include <age/physics/phinertia.h>
 #include <age/mcnetwork/netmanager.h>
 
@@ -103,11 +102,6 @@ namespace {
     float orbitRecenterDelay = 1.5f;
     float orbitMoveSpeed = 0.5f; // metres per second
     float orbitMinElevation = 0.0f; // degrees above the vehicle pivot
-    bool orbitCollision = true;
-    float orbitCollisionRadius = 0.35f;
-    float orbitCollisionPadding = 0.10f;
-    float orbitCollisionRecovery = 8.0f;
-    float orbitSafeDistance = -1.0f;
     float orbitMovingTime = 0.0f;
     bool orbitMoving = false;
     const mcCarSim* orbitLastCar = nullptr;
@@ -125,7 +119,6 @@ namespace {
         orbitMovingTime = 0.0f;
         orbitMoving = false;
         orbitLastCar = nullptr;
-        orbitSafeDistance = -1.0f;
         orbitActive = false;
     }
     void LoadOrbitInput() {
@@ -151,59 +144,6 @@ namespace {
         float a = fabsf(v);
         if (a <= orbitDeadZone) return 0.0f;
         return (v < 0.0f ? -1.0f : 1.0f) * (a - orbitDeadZone) / (1.0f - orbitDeadZone);
-    }
-    // Native chase-camera sweep: mc2.exe 0x57A69B calls phLevel vtable +0xB8.
-    // The original caller reads the remaining distance at result +0x20.
-    // ABI and result offsets are inferred from the supplied 32-bit executable.
-    struct OrbitSweepResult {
-        unsigned char prefix[0x04];
-        float normalX, normalY, normalZ; // Native caller reads result +0x04..0x0C.
-        unsigned char middle[0x10];
-        float remaining;
-        unsigned char suffix[0x40 - 0x24];
-    };
-    static_assert(sizeof(OrbitSweepResult) == 0x40, "Sweep buffer size");
-    typedef bool (__thiscall *OrbitSweep)(phLevel*, Vector3*, Vector3*, float,
-                                         OrbitSweepResult*, int, int, int);
-    void ApplyOrbitCollision(const Vector3& pivot, mcCarSim* sim, float dt) {
-        if (!orbitCollision) { orbitSafeDistance = -1.0f; return; }
-        phLevel* level = phLevel::Instance;
-        if (!level || !sim->m_Collider->m_SomeInstParent) {
-            orbitSafeDistance = -1.0f; return;
-        }
-        Vector3 start = pivot;
-        Vector3 end = orbitMatrix.GetRow(3);
-        Vector3 delta = end - start;
-        float distance = delta.Mag();
-        if (!(distance > 0.001f && distance < 30.0f)) return;
-        // Same player exclusion ID and default mask (0x1F) as camTrackCS.
-        int ignoreId = reinterpret_cast<int>(sim->m_Collider->m_SomeInstParent->m_Archetype);
-        void** vtable = *reinterpret_cast<void***>(level);
-        if (!vtable || !vtable[0xB8 / sizeof(void*)]) return;
-        OrbitSweep sweep = reinterpret_cast<OrbitSweep>(vtable[0xB8 / sizeof(void*)]);
-        OrbitSweepResult hit = {};
-        float allowed = distance;
-        if (sweep(level, &start, &end, orbitCollisionRadius, &hit, ignoreId, 0x1F, 1)) {
-            // Match camTrackCS at 0x57A6A9: accept only a normal opposing
-            // the normalized sweep direction (native threshold -0.00001f).
-            const float normalDot = (hit.normalX * delta.X + hit.normalY * delta.Y +
-                                     hit.normalZ * delta.Z) / distance;
-            // The native caller accepts only a hit fraction strictly between 0 and 1.
-            // Reject exit faces and invalid/initial-overlap distances rather than
-            // collapsing the camera onto the pivot.
-            if (std::isfinite(normalDot) && normalDot < -0.00001f &&
-                std::isfinite(hit.remaining) && hit.remaining > 0.0f &&
-                hit.remaining < distance) {
-                allowed = OrbitClamp(distance - hit.remaining - orbitCollisionPadding, 0.0f, distance);
-            }
-        }
-        if (orbitSafeDistance < 0.0f || allowed < orbitSafeDistance) {
-            orbitSafeDistance = allowed; // retract immediately, never interpolate through wall
-        } else {
-            orbitSafeDistance += (allowed - orbitSafeDistance) * (1.0f - expf(-orbitCollisionRecovery * dt));
-        }
-        orbitSafeDistance = OrbitClamp(orbitSafeDistance, 0.0f, allowed);
-        orbitMatrix.SetRow(3, pivot + delta * (orbitSafeDistance / distance));
     }
     void LandingDiagnostic(const char* stage, mcCarSim* sim = nullptr, float distanceSq = 0.0f, float dt = 0.0f) {
         if (!landingDebug) return;
@@ -390,7 +330,6 @@ namespace {
         }
         if (fabsf(orbitYaw) < 0.001f && fabsf(orbitPitch) < 0.001f) {
             orbitYaw = orbitPitch = 0.0f;
-            orbitSafeDistance = -1.0f;
             return;
         }
         // Positive pitch lowers the radial vector around axis (Z,0,-X).
@@ -416,7 +355,6 @@ namespace {
             orbitMatrix.Dot(rot);
         }
         orbitMatrix.SetRow(3, orbitMatrix.GetRow(3) + pivot);
-        ApplyOrbitCollision(pivot, sim, dt);
         orbitActive = true;
     }
 }
@@ -909,10 +847,6 @@ void FreeCamHandler::Install()
         orbitInvertY = HookConfig::GetBool("OrbitCamera", "InvertY", false);
         orbitRecenterDelay = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "RecenterDelay", 1.5f), 0.0f, 10.0f);
         orbitMoveSpeed = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "MoveSpeedThreshold", 0.5f), 0.1f, 10.0f);
-        orbitCollision = HookConfig::GetBool("OrbitCamera", "EnableCollision", true);
-        orbitCollisionRadius = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "CollisionRadius", 0.35f), 0.1f, 1.0f);
-        orbitCollisionPadding = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "CollisionPadding", 0.10f), 0.0f, 0.5f);
-        orbitCollisionRecovery = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "CollisionRecovery", 8.0f), 0.5f, 30.0f);
         orbitMinElevation = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "MinElevation", -10.0f), -75.0f, 30.0f);
 
         landingEnabled = HookConfig::GetBool("LandingShake", "EnableLandingShake", false);
