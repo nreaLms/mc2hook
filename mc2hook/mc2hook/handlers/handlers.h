@@ -38,6 +38,7 @@
 #include <handlers/LightTrailHandler.h>
 #include <handlers/MotionBlurHandler.h>
 #include <handlers/QuickLaunchHandler.h>
+#include <handlers/CruiseArrestHandler.h>
 #include <handlers/TrafficDiagnosticsHandler.h>
 #include <handlers/AnimationCrashDiagnostics.h>
 
@@ -67,6 +68,7 @@ static void InstallHandlersPostEngineInit()
 static void InstallMainHandlers()
 {    
     InstallHandler<REHandler>("RE Handler");
+    CruiseArrestHandler::Install();
 
     InstallHandler<CustomExceptionHandler>("Custom Exception Handler");
     AnimationCrashDiagnostics::Install();
