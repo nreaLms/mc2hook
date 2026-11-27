@@ -39,6 +39,7 @@
 #include <handlers/MotionBlurHandler.h>
 #include <handlers/QuickLaunchHandler.h>
 #include <handlers/TrafficDiagnosticsHandler.h>
+#include <handlers/AnimationCrashDiagnostics.h>
 
 // Installed before engine init
 static void InstallHandlersPreEngineInit()
@@ -68,6 +69,7 @@ static void InstallMainHandlers()
     InstallHandler<REHandler>("RE Handler");
 
     InstallHandler<CustomExceptionHandler>("Custom Exception Handler");
+    AnimationCrashDiagnostics::Install();
     InstallHandler<PrinterHandler>("Printer Handler");
     InstallHandler<zipInitHandler>("ZIP Handler");
     InstallHandler<zipEnumHandler>("ZIP Enum Handler");
