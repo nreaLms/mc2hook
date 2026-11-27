@@ -1,6 +1,7 @@
 #pragma once
 #include <framework/HookConfig.h>
 #include <cmath>
+#include "LiveEffectSettings.h"
 
 // Independent effect; submitted by the existing pre-HUD compositor.
 class BoostVignette {
@@ -11,11 +12,12 @@ class BoostVignette {
         return std::isfinite(v) ? Clamp(v, lo, hi) : def;
     }
 public:
-    static bool Enabled() { static const bool v = HookConfig::GetBool("BoostVignette", "EnableBoostVignette", false); return v; }
+    static bool Enabled() { return LiveEffectSettings::Get(LiveEffectSettings::BoostVignette); }
     static void Reset() { opacity = 0.0f; }
     static float Update(bool active, float dt, bool hasFov, float fovWeight) {
         if (!Enabled()) { Reset(); return 0.0f; }
-        static const float intensity = Config("Intensity", .55f, 0.f, 1.f);
+        static const float baseIntensity = Config("Intensity", .55f, 0.f, 1.f);
+        const float intensity = Clamp(baseIntensity * LiveEffectSettings::Scale(LiveEffectSettings::BoostVignette), 0.f, 1.f);
         // Independent fade only when the native FOV envelope is unavailable.
         const float target = active ? intensity : 0.f;
         opacity += (target-opacity)*(1.f-std::exp(-(active ? 22.f : 7.f)*dt));

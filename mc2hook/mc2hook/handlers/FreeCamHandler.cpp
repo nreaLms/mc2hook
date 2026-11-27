@@ -1,5 +1,6 @@
 #include "FreecamHandler.h"
 #include "BoostFOVEnvelope.h"
+#include "LiveEffectSettings.h"
 #include <age/vector/matrix34.h>
 #include <age/vector/matrix44.h>
 #include <age/gfx/rstate.h>
@@ -212,10 +213,13 @@ namespace {
         const float t = landingAge / landingDuration;
         if (t >= 1.0f) { landingStrength = 0.0f; return 0.0f; }
         const float envelope = 1.0f - t;
-        return landingIntensity * landingStrength * envelope * sinf(t * 6.28318530718f) * 0.01745329252f;
+        return OrbitClamp(landingIntensity * LiveEffectSettings::Scale(LiveEffectSettings::LandingShake), 0.0f, 5.0f) * landingStrength * envelope * sinf(t * 6.28318530718f) * 0.01745329252f;
     }
     // Rotate a copy of the final camera, leaving its collision-tested position intact.
     void UpdateShake(const Matrix34& original) {
+        shakeEnabled = LiveEffectSettings::Get(LiveEffectSettings::CameraShake);
+        landingEnabled = LiveEffectSettings::Get(LiveEffectSettings::LandingShake);
+        boostShakeEnabled = LiveEffectSettings::Get(LiveEffectSettings::BoostShake);
         shakeActive = false;
         if ((!shakeEnabled && !landingEnabled && !boostShakeEnabled) || overrideCameraMtx || mirrorMode ||
             datTimeManager::SpeedrunMode || mcNetManager::IsNetworkMode) { LandingDiagnostic("mode blocked"); ResetShake(); return; }
@@ -258,17 +262,20 @@ namespace {
             if (boostShakeWeight < 0.0001f) boostShakeWeight = 0.0f;
             boostKickAge = OrbitClamp(boostKickAge + dt, 0.0f, boostKickDuration);
             const float kickT = boostKickAge / boostKickDuration;
-            const float kick = kickT < 1.0f ? boostKickIntensity * sinf(3.14159265f * kickT) * sinf(3.14159265f * kickT) : 0.0f;
+            const float boostLevel = LiveEffectSettings::Scale(LiveEffectSettings::BoostShake);
+            const float kick = kickT < 1.0f ? OrbitClamp(boostKickIntensity * boostLevel, 0.0f, 5.0f) * sinf(3.14159265f * kickT) * sinf(3.14159265f * kickT) : 0.0f;
             boostShakeTime = fmodf(boostShakeTime + dt * 6.28318530718f, 6.28318530718f);
-            const float amp = (boostIntensity * boostShakeWeight + kick) * 0.01745329252f;
+            const float amp = (OrbitClamp(boostIntensity * boostLevel, 0.0f, 3.0f) * boostShakeWeight + kick) * 0.01745329252f;
             boostYaw = amp * (0.55f * sinf(boostShakeTime * 11.0f) + 0.30f * sinf(boostShakeTime * 7.0f));
             boostPitch = amp * (0.65f * sinf(boostShakeTime * 13.0f) + 0.35f * sinf(boostShakeTime * 9.0f));
         }
+        else { boostWasActive = false; boostShakeWeight = boostShakeTime = 0.0f; boostKickAge = boostKickDuration; }
+        if (!shakeEnabled) shakeAmount = 0.0f;
         if (shakeAmount == 0.0f && fabsf(landingPitch) < 0.000001f && fabsf(boostYaw) < 0.000001f && fabsf(boostPitch) < 0.000001f) return;
         shakeBaseMatrix = orbitActive ? orbitMatrix : original;
         shakeMatrix = shakeBaseMatrix;
         Vector3 position = shakeMatrix.GetRow(3);
-        float amplitude = shakeIntensity * shakeAmount * 0.01745329252f;
+        float amplitude = OrbitClamp(shakeIntensity * LiveEffectSettings::Scale(LiveEffectSettings::CameraShake), 0.0f, 3.0f) * shakeAmount * 0.01745329252f;
         // Continuous blended waves, no random jumps or position changes.
         float yaw = amplitude * (0.65f * sinf(shakeTime * 0.73f) + 0.35f * sinf(shakeTime * 1.31f)) + boostYaw;
         float pitch = amplitude * (0.65f * sinf(shakeTime) + 0.35f * sinf(shakeTime * 1.57f)) + landingPitch + boostPitch;
@@ -282,6 +289,7 @@ namespace {
     }
 
     void UpdateOrbit(const Matrix34& original) {
+        orbitEnabled = LiveEffectSettings::Get(LiveEffectSettings::OrbitCamera);
         orbitActive = false;
         static bool inputAttempted = false;
         if (orbitEnabled && !inputAttempted) { inputAttempted = true; LoadOrbitInput(); }
@@ -608,6 +616,9 @@ namespace {
     float nativeBoostDecay = 1.85f;
     constexpr float nativeBoostDecayExponent = 1.85f;
     float nativeBoostPeakStrength = 0.80f;
+    static float EffectiveBoostPeak() {
+        return OrbitClamp(nativeBoostPeakStrength * LiveEffectSettings::Scale(LiveEffectSettings::BoostCamera), 0.01f, 0.9999f);
+    }
     constexpr float nativeBoostSustain = 0.00f;
         using NativeFovApproach = int (__cdecl*)(float*, float, float, float);
 
@@ -638,19 +649,19 @@ namespace {
     // SST activation sets its active byte and resets the use timer.
     static void __fastcall NitroActivated(vehNitro* object, void*) {
         reinterpret_cast<void (__thiscall*)(vehNitro*)>(0x4D1EF0)(object);
-        if (object && !mcNetManager::IsNetworkMode && !datTimeManager::SpeedrunMode)
+        if (object && LiveEffectSettings::Get(LiveEffectSettings::BoostCamera) && !mcNetManager::IsNetworkMode && !datTimeManager::SpeedrunMode)
             GetBoostCurve(&object->dword_2c).retrigger = true;
     }
     static void __fastcall SSTActivated(mcCarSSTurbo* object, void*) {
         reinterpret_cast<void (__thiscall*)(mcCarSSTurbo*)>(0x4D4200)(object);
-        if (object && !mcNetManager::IsNetworkMode && !datTimeManager::SpeedrunMode)
+        if (object && LiveEffectSettings::Get(LiveEffectSettings::BoostCamera) && !mcNetManager::IsNetworkMode && !datTimeManager::SpeedrunMode)
             GetBoostCurve(&object->dword_3c).retrigger = true;
     }
 
     static int NativeBoostFovStep(float* value, float target, float rate,
                                   float dt, uintptr_t amplitudeOffset) {
         auto original = reinterpret_cast<NativeFovApproach>(0x46A2E0);
-        if (!value || mcNetManager::IsNetworkMode || datTimeManager::SpeedrunMode) {
+        if (!value || !LiveEffectSettings::Get(LiveEffectSettings::BoostCamera) || mcNetManager::IsNetworkMode || datTimeManager::SpeedrunMode) {
             for (auto& state : boostCurves) state = BoostCurveState{};
             return original(value, target, rate, dt);
         }
@@ -687,7 +698,7 @@ namespace {
         state.age = OrbitClamp(state.age + dt, 0.0f, nativeBoostAttack + nativeBoostDecay);
         // Keep the peak just below the native target: the original callers
         // skip the helper entirely when the field equals that target.
-        const float peak = nativeBoostPeakStrength;
+        const float peak = EffectiveBoostPeak();
         float amount;
         if (state.age < nativeBoostAttack) {
             const float t = state.age / nativeBoostAttack;
@@ -736,7 +747,7 @@ namespace {
     static void __fastcall UnifiedBoostUpdateSS(void* camera, void*) {
         using UpdateSS = void (__thiscall*)(void*);
         const auto original = reinterpret_cast<UpdateSS>(0x46F140);
-        if (!camera || mcNetManager::IsNetworkMode || datTimeManager::SpeedrunMode) {
+        if (!camera || !LiveEffectSettings::Get(LiveEffectSettings::BoostCamera) || mcNetManager::IsNetworkMode || datTimeManager::SpeedrunMode) {
             original(camera); return;
         }
         mcGameState* game = mcGameState::Instance;
@@ -770,7 +781,7 @@ namespace {
     }
 
     static void InstallNativeBoostFov() {
-        if (!HookConfig::GetBool("BoostCamera", "EnableBoostCamera", false)) return;
+        if (!LiveEffectSettings::MenuEnabled() && !LiveEffectSettings::Get(LiveEffectSettings::BoostCamera)) return;
         const float attack = HookConfig::GetFloat("BoostCamera", "AttackTime", 0.65f);
         const float decay = HookConfig::GetFloat("BoostCamera", "DecayTime", 1.85f);
         const float peakStrength = HookConfig::GetFloat("BoostCamera", "PeakStrength", 0.80f);
@@ -812,7 +823,7 @@ namespace {
 // No timer, cached vehicle pointer or additional projection modification.
 bool GetBoostFOVEnvelope(const mcCarSim* sim, float& nitro, float& sst) {
     nitro = sst = 0.0f;
-    if (!nativeBoostFovInstalled || !sim || mcNetManager::IsNetworkMode ||
+    if (!nativeBoostFovInstalled || !LiveEffectSettings::Get(LiveEffectSettings::BoostCamera) || !sim || mcNetManager::IsNetworkMode ||
         datTimeManager::SpeedrunMode) return false;
     auto readWeight = [](const void* object, unsigned offset, unsigned amplitudeOffset, float& out) {
         if (!object) return true;
@@ -824,7 +835,7 @@ bool GetBoostFOVEnvelope(const mcCarSim* sim, float& nitro, float& sst) {
         const float range = maximum - baseline;
         if (!std::isfinite(value) || !std::isfinite(range) || !std::isfinite(baseline)) return false;
         if (range <= 0.0f) return true; // No native FOV contribution configured.
-        out = OrbitClamp((value - baseline) / range / nativeBoostPeakStrength, 0.0f, 1.0f);
+        out = OrbitClamp((value - baseline) / range / EffectiveBoostPeak(), 0.0f, 1.0f);
         if (out < 0.001f) out = 0.0f; // Ignore native helper's tiny positive floor.
         return true;
     };
@@ -839,7 +850,7 @@ void FreeCamHandler::Install()
 
     if (enableFreecam)
     {
-        orbitEnabled = HookConfig::GetBool("OrbitCamera", "EnableOrbitCamera", false);
+        orbitEnabled = LiveEffectSettings::Get(LiveEffectSettings::OrbitCamera);
         orbitYawSpeed = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "HorizontalSpeed", 180.0f), 10.0f, 720.0f);
         orbitPitchSpeed = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "VerticalSpeed", 90.0f), 0.0f, 360.0f);
         orbitDeadZone = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "DeadZone", 0.18f), 0.0f, 0.95f);
@@ -849,13 +860,13 @@ void FreeCamHandler::Install()
         orbitMoveSpeed = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "MoveSpeedThreshold", 0.5f), 0.1f, 10.0f);
         orbitMinElevation = OrbitClamp(HookConfig::GetFloat("OrbitCamera", "MinElevation", -10.0f), -75.0f, 30.0f);
 
-        landingEnabled = HookConfig::GetBool("LandingShake", "EnableLandingShake", false);
+        landingEnabled = LiveEffectSettings::Get(LiveEffectSettings::LandingShake);
         landingDebug = HookConfig::GetBool("LandingShake", "Debug", false);
 
         landingIntensity = OrbitClamp(HookConfig::GetFloat("LandingShake", "Intensity", 0.8f), 0.0f, 5.0f);
         landingDuration = OrbitClamp(HookConfig::GetFloat("LandingShake", "Duration", 0.24f), 0.10f, 0.80f);
         hook_output("[LandingShake] v0.5.2b enabled=%d debug=%d intensity=%.2f duration=%.2f", int(landingEnabled), int(landingDebug), landingIntensity, landingDuration);
-        boostShakeEnabled = HookConfig::GetBool("BoostShake", "EnableBoostShake", false);
+        boostShakeEnabled = LiveEffectSettings::Get(LiveEffectSettings::BoostShake);
         boostIntensity = HookConfig::GetFloat("BoostShake", "Intensity", 1.0f);
         boostKickIntensity = HookConfig::GetFloat("BoostShake", "KickIntensity", 2.5f);
         boostKickDuration = HookConfig::GetFloat("BoostShake", "KickDuration", 0.30f);
@@ -863,7 +874,7 @@ void FreeCamHandler::Install()
         boostKickIntensity = std::isfinite(boostKickIntensity) ? OrbitClamp(boostKickIntensity, 0.0f, 5.0f) : 2.5f;
         boostKickDuration = std::isfinite(boostKickDuration) ? OrbitClamp(boostKickDuration, 0.10f, 1.0f) : 0.30f;
         boostKickAge = boostKickDuration;
-        shakeEnabled = HookConfig::GetBool("CameraShake", "EnableCameraShake", false);
+        shakeEnabled = LiveEffectSettings::Get(LiveEffectSettings::CameraShake);
         shakeMinSpeed = OrbitClamp(HookConfig::GetFloat("CameraShake", "MinSpeed", 100.0f), 0.0f, 999.0f);
         shakeMaxSpeed = OrbitClamp(HookConfig::GetFloat("CameraShake", "MaxSpeed", 280.0f), shakeMinSpeed + 1.0f, 1000.0f);
         shakeIntensity = OrbitClamp(HookConfig::GetFloat("CameraShake", "Intensity", 0.15f), 0.0f, 3.0f);

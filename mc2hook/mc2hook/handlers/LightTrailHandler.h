@@ -12,6 +12,7 @@
 #include <array>
 #include <map>
 #include <deque>
+#include "LiveEffectSettings.h"
 
 // Implemented by the Orbit Camera v0.4 compatibility bridge.
 bool GetLightTrailShakeMatrices(Matrix34& base, Matrix34& shaken);
@@ -295,7 +296,11 @@ class LightTrailHandler {
     }
     static void __cdecl Draw(int mode,const Sprite* sprites,const Meta* meta,int count) {
         reinterpret_cast<DrawFn>(0x5FB7E0)(mode,sprites,meta,count);
-        auto& b=State(); auto* game=mcGameState::Instance.get();
+        auto& b=State();
+        if (!LiveEffectSettings::Get(LiveEffectSettings::LightTrails)) {
+            b.valid=b.seen=false; b.reverseHistory.clear(); b.reverseTime=0.0; return;
+        }
+        auto* game=mcGameState::Instance.get();
         if(!game || game->m_CurrentState!=GameState::Game || game->m_IsPaused || game->m_IsPausedLocally || datTimeManager::SpeedrunMode) { b.valid=b.seen=false; return; }
         if(mode!=1) return;
         auto* dev=gfxState::lpD3DDevice.get(); D3DVIEWPORT9 vp={};
@@ -315,6 +320,8 @@ class LightTrailHandler {
         const float persistence=Setting("TrailPersistence",.15f,.02f,1.0f);
         const float decay=Setting("TrailDecay",2.0f,.1f,10.0f);
         const float intensity=Setting("TrailIntensity",.65f,0,1);
+        const float effectiveIntensity=intensity * LiveEffectSettings::Scale(LiveEffectSettings::LightTrails);
+        const float outputIntensity=effectiveIntensity > 1.0f ? 1.0f : effectiveIntensity;
         const float radius=Setting("FootprintRadius",6.0f,1,32)*vp.Height/1080.0f;
         const float retention=history?std::exp(-decay*dt/persistence):0;
         const float injection=1-retention;
@@ -443,7 +450,7 @@ class LightTrailHandler {
         if(ok && expired) ok=SUCCEEDED(dev->Clear(0,nullptr,D3DCLEAR_TARGET,0,1,0));
         // Composite previous history only: no duplicate current flare at its current position.
         if(!guard.RestoreTarget()) ok=false;
-        if(ok && history && !expired) ok=Blit(dev,b.tex[reverse?next:b.front],vp.Width,vp.Height,reverse?intensity:intensity*retention,true);
+        if(ok && history && !expired) ok=Blit(dev,b.tex[reverse?next:b.front],vp.Width,vp.Height,reverse?outputIntensity:outputIntensity*retention,true);
         if(ok) { b.front=next; b.valid=true; b.seen=true; b.frame=frame; b.time=now.QuadPart; b.previous=stable; if(HookConfig::GetBool("LightTrails","DebugTrails",false)) {
             static ULONGLONG lastReport=0; const auto tick=GetTickCount64();
             if(!lastReport || tick-lastReport>=1500) {
@@ -455,7 +462,7 @@ class LightTrailHandler {
     }
 public:
     static void Install() {
-        if(!HookConfig::GetBool("LightTrails","EnableLightTrails",false)) return;
+        if(!LiveEffectSettings::MenuEnabled() && !LiveEffectSettings::Get(LiveEffectSettings::LightTrails)) return;
         if(reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr))!=0x400000) return;
         const unsigned char expected[]={0xE8,0xD6,0xCF,0x0D,0x00};
         if(std::memcmp(reinterpret_cast<const void*>(0x51E805),expected,sizeof(expected))!=0) { hook_output("[LightTrails v0.6.5] Unsupported call site.\n"); return; }

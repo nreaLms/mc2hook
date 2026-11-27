@@ -34,6 +34,7 @@
 #include <handlers/RenderDistanceHandler.h>
 #include <handlers/StateResearchHook.h>
 
+#include <handlers/SpecialSettingsHandler.h>
 #include <handlers/LightTrailHandler.h>
 #include <handlers/MotionBlurHandler.h>
 #include <handlers/QuickLaunchHandler.h>
@@ -88,6 +89,7 @@ static void InstallMainHandlers()
     InstallHandler<RenderDistanceHandler>("RenderDistance Handler");
     InstallHandler<ShaderHandler>("Shader Handler");
 
+    InstallHandler<SpecialSettingsHandler>("Special Settings Handler");
     InstallHandler<LightTrailHandler>("Light Trail Handler");
     InstallHandler<MotionBlurHandler>("Motion Blur Handler");
     InstallHandler<QuickLaunchHandler>("Quick Launch Handler");

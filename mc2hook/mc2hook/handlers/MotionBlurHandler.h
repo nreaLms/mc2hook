@@ -19,6 +19,7 @@
 #include <vector>
 #include <cstdint>
 #include "BoostVignette.h"
+#include "LiveEffectSettings.h"
 #include "BoostFOVEnvelope.h"
 
 class MotionBlurHandler {
@@ -74,8 +75,7 @@ class MotionBlurHandler {
     static float Saturate(float x) { return Clamp(x, 0.0f, 1.0f); }
 
     static bool Enabled() {
-        static bool enabled = HookConfig::GetBool("MotionBlur", "EnableMotionBlur", false);
-        return enabled;
+        return LiveEffectSettings::Get(LiveEffectSettings::MotionBlur) || LiveEffectSettings::Get(LiveEffectSettings::BoostBlur);
     }
     static float ConfigF(const char* key, float def, float lo, float hi) {
         const float v = HookConfig::GetFloat("MotionBlur", key, def);
@@ -92,9 +92,8 @@ class MotionBlurHandler {
         return std::isfinite(v) ? Clamp(v, lo, hi) : def;
     }
     static float BoostMultiplier() {
-        static const bool enabled = HookConfig::GetBool("BoostBlur", "EnableBoostBlur", true);
         static const float value = BoostConfig("Multiplier", 3.5f, 1.0f, 5.0f);
-        return enabled ? value : 1.0f;
+        return value;
     }
     static float boostFovWeightForBlur(float nitro, float sst) {
         if (!s_NativeSSTSuppressed) sst = 0.0f;
@@ -165,7 +164,8 @@ class MotionBlurHandler {
         static const float baseHeight = ConfigF("MaskHeight", 0.20f, 0.06f, 0.34f);
         static const float feather = ConfigF("MaskFalloff", 0.297f, 0.02f, 1.50f);
         // Open-ended rounded rectangle: straight arms, circular lower corners.
-        static const float boostScale = BoostConfig("MaskScale", 0.45f, 0.25f, 1.0f);
+        static const float baseBoostScale = BoostConfig("MaskScale", 0.45f, 0.25f, 1.0f);
+        const float boostScale = Clamp(1.0f - (1.0f-baseBoostScale) * LiveEffectSettings::Scale(LiveEffectSettings::BoostBlur), 0.25f, 1.0f);
         const float scale = 1.0f + (boostScale - 1.0f) * s_BoostMaskWeight;
         const float halfW = baseWidth * scale * aspect;
         const float height = baseHeight * scale;
@@ -237,15 +237,24 @@ class MotionBlurHandler {
     }
 
     static void ApplyBlur(IDirect3DDevice9* device, bool preHud = false) {
-        if (s_Busy || (!Enabled() && !BoostVignette::Enabled())) return;
+        if (s_Busy) return;
+        if (!Enabled()) {
+            s_BlurAmount=s_BaseBlurAmount=s_LegacyBlurAmount=0;
+            s_LegacyMaskWeight=s_BoostMaskWeight=0;
+        }
+        if (!BoostVignette::Enabled()) BoostVignette::Reset();
+        if (!Enabled() && !BoostVignette::Enabled()) { s_LastTicks=0; return; }
         if (datTimeManager::SpeedrunMode || device != gfxState::lpD3DDevice.get()) return;
         auto* game = mcGameState::Instance.get();
         if (!game || game->m_CurrentState != GameState::Game || game->m_IsPaused || game->m_IsPausedLocally) { s_BlurAmount=0; s_BaseBlurAmount=0; s_LegacyBlurAmount=0; s_LegacyMaskWeight=0; s_BoostMaskWeight=0; s_LastTicks=0; BoostVignette::Reset(); return; }
 
-        static const int debugMode = Enabled() ? ConfigI("DebugMode", 0, 0, 3) : 0;
+        static const int configuredDebugMode = ConfigI("DebugMode", 0, 0, 3);
+        const int debugMode = Enabled() ? configuredDebugMode : 0;
         static const float minSpeed = ConfigF("MinSpeed", 75.0f, 0.0f, 400.0f);
         static const float maxSpeed = ConfigF("MaxSpeed", 230.0f, minSpeed + 1.0f, 600.0f);
         static const float maxIntensity = ConfigF("Intensity", 0.050f, 0.0f, 0.20f);
+        const float normalIntensity = Clamp(maxIntensity * LiveEffectSettings::Scale(LiveEffectSettings::MotionBlur), 0.0f, 0.20f);
+        const float boostLevel = LiveEffectSettings::Scale(LiveEffectSettings::BoostBlur);
         static const int samples = ConfigI("Samples", 16, 2, 32);
         static const float speedCurve = ConfigF("SpeedCurve", 1.20f, 0.25f, 4.0f);
         static const float smoothing = ConfigF("Smoothing", 5.0f, 0.1f, 20.0f);
@@ -267,22 +276,27 @@ class MotionBlurHandler {
         if(debug && ticks-lastLog>=2000) { lastLog=ticks; hook_output("[MotionBlur] Speed %.1f km/h, blur %.4f",speed,s_BlurAmount); }
         const float speedWeight = std::pow(Saturate((speed - minSpeed) / (maxSpeed - minSpeed)), speedCurve);
         const float boost = BoostMultiplier();
-        const bool boosting = boost > 1.0f && (nitroActive || (sstActive && s_NativeSSTSuppressed));
+        const bool boosting = boostLevel > 0.0f && boost > 1.0f && (nitroActive || (sstActive && s_NativeSSTSuppressed));
         // A small floor ensures the boost is visible even below MinSpeed.
         const float boostWeight = speedWeight > 0.35f ? speedWeight : 0.35f;
-        const float target = Clamp(maxIntensity * (speedWeight + (boosting ? (boost-1.0f)*boostWeight : 0.0f)), 0.0f, 0.20f);
+        const float baseTarget = normalIntensity * speedWeight;
+        const float rawExtra = maxIntensity * (boost-1.0f) * boostWeight;
+        const float targetExtra = Clamp(Clamp(rawExtra, 0.0f, 0.20f-baseTarget) * boostLevel, 0.0f, 0.20f-baseTarget);
+        const float target = baseTarget + (boosting ? targetExtra : 0.0f);
         const float k = 1.0f - std::exp(-smoothing * dt);
         s_LegacyBlurAmount += (target - s_LegacyBlurAmount) * k;
-        s_BaseBlurAmount += (maxIntensity * speedWeight - s_BaseBlurAmount) * k;
+        s_BaseBlurAmount += (baseTarget - s_BaseBlurAmount) * k;
+        if (normalIntensity == 0.0f) s_BaseBlurAmount = 0.0f;
+        if (boostLevel == 0.0f) { s_LegacyBlurAmount = s_BaseBlurAmount; s_LegacyMaskWeight = 0.0f; }
         s_LegacyMaskWeight = Saturate(s_LegacyMaskWeight + ((boosting ? 1.0f : 0.0f) - s_LegacyMaskWeight) * k);
         const float mix = hasFov ? 1.0f : 0.0f;
         // Cap the peak BEFORE applying the envelope, not the animated result.
         // This keeps the safety limit without flattening the synchronized peak.
-        const float peakExtra = Clamp(maxIntensity * (boost-1.0f) * boostWeight,
-                                      0.0f, Clamp(0.20f-s_BaseBlurAmount, 0.0f, 0.20f));
+        const float headroom = Clamp(0.20f-s_BaseBlurAmount, 0.0f, 0.20f);
+        const float peakExtra = Clamp(Clamp(rawExtra, 0.0f, headroom) * boostLevel, 0.0f, headroom);
         const float syncedBlur = Clamp(s_BaseBlurAmount + peakExtra * blurFovWeight, 0.0f, 0.20f);
         s_BlurAmount = s_LegacyBlurAmount + (syncedBlur - s_LegacyBlurAmount) * mix;
-        const float syncedMask = boost > 1.0f ? blurFovWeight : 0.0f;
+        const float syncedMask = boostLevel > 0.0f && boost > 1.0f ? blurFovWeight : 0.0f;
         s_BoostMaskWeight = Saturate(s_LegacyMaskWeight + (syncedMask - s_LegacyMaskWeight) * mix);
         const float vignette = preHud ? BoostVignette::Update(nitroActive || sstActive, dt, hasFov, fovWeight) : 0.0f;
         const bool drawBlur = Enabled() && (debugMode != 0 || s_BlurAmount >= 0.0005f);
@@ -490,7 +504,8 @@ class MotionBlurHandler {
     // Replace only those two subtractions with ST(0)-ST(0); preserve the x87
     // stack, original stores, boost physics, FOV, and unrelated blur flags.
     static void SuppressNativeSSTBlur() {
-        if (!s_PreHudInstalled || BoostMultiplier() <= 1.0f) return;
+        if (!s_PreHudInstalled || BoostMultiplier() <= 1.0f ||
+            (!LiveEffectSettings::MenuEnabled() && !LiveEffectSettings::Get(LiveEffectSettings::BoostBlur))) return;
         if (reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr)) != 0x400000) return;
         auto* a = reinterpret_cast<unsigned char*>(0x4D479A);
         auto* b = reinterpret_cast<unsigned char*>(0x4D49CF);
@@ -543,7 +558,7 @@ class MotionBlurHandler {
 
     static DWORD WINAPI HookThread(LPVOID) {
         for (;;) {
-            if (s_Hooked || (!Enabled() && !BoostVignette::Enabled())) return 0;
+            if (s_Hooked || (!LiveEffectSettings::MenuEnabled() && !Enabled() && !BoostVignette::Enabled())) return 0;
             IDirect3DDevice9* device = gfxState::lpD3DDevice;
             if (device) {
                 void** vtbl = *reinterpret_cast<void***>(device);
@@ -567,10 +582,10 @@ class MotionBlurHandler {
 
 public:
     static void Install() {
-        if (!Enabled() && !BoostVignette::Enabled()) return;
+        if (!LiveEffectSettings::MenuEnabled() && !Enabled() && !BoostVignette::Enabled()) return;
         if (s_Thread) return;
         InstallPreHud();
-        if (Enabled()) SuppressNativeSSTBlur();
+        if (Enabled() || LiveEffectSettings::MenuEnabled()) SuppressNativeSSTBlur();
         s_Thread = CreateThread(nullptr, 0, &HookThread, nullptr, 0, nullptr);
         if (s_Thread) {
             CloseHandle(s_Thread);
