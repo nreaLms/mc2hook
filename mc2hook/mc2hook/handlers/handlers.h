@@ -36,6 +36,7 @@
 
 // MC2+
 #include <features/OrbitCamera.h>
+#include <features/LightTrails.h>
 
 // Installed before engine init
 static void InstallHandlersPreEngineInit()
@@ -57,6 +58,7 @@ static void InstallHandlersPostEngineInit()
 
     // MC2+
     InstallHandler<OrbitCamera>("Orbit Camera");
+    InstallHandler<LightTrails>("Light Trails");
 
     //InstallHandler<TestPanelHandler>("Panel Handler (Keyboard input test really)");
     //InstallHandler<OnlineBangersHandler>("Online Bangers Handler");
