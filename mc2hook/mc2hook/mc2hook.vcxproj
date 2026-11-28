@@ -157,6 +157,8 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="age\age.h" />
+    <ClInclude Include="features\OrbitCamera.h" />
+    <ClInclude Include="features\PlusConfig.h" />
     <ClInclude Include="mcai\input.h" />
     <ClInclude Include="mcai\opponent.h" />
     <ClInclude Include="mcai\manager.h" />
@@ -349,6 +351,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="age\age.cpp" />
+    <ClCompile Include="features\OrbitCamera.cpp" />
+    <ClCompile Include="features\PlusConfig.cpp" />
     <ClCompile Include="mcai\opponent.cpp" />
     <ClCompile Include="mcai\manager.cpp" />
     <ClCompile Include="age\camera\playercamera.cpp" />

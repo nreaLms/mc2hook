@@ -34,6 +34,9 @@
 #include <handlers/RenderDistanceHandler.h>
 #include <handlers/StateResearchHook.h>
 
+// MC2+
+#include <features/OrbitCamera.h>
+
 // Installed before engine init
 static void InstallHandlersPreEngineInit()
 {
@@ -51,6 +54,9 @@ static void InstallHandlersPostEngineInit()
     InstallHandler<PathHandler>("Path Handler");
     InstallHandler<AddressPrinterHandler>("Address Printer Handler");
     InstallHandler<TrafficDistanceHandler>("Traffic Distance Handler");
+
+    // MC2+
+    InstallHandler<OrbitCamera>("Orbit Camera");
 
     //InstallHandler<TestPanelHandler>("Panel Handler (Keyboard input test really)");
     //InstallHandler<OnlineBangersHandler>("Online Bangers Handler");
@@ -71,7 +77,7 @@ static void InstallMainHandlers()
     InstallHandler<ChatHandler>("Chat Handler");
     InstallHandler<InitHandler>("Game Init Handler");
     InstallHandler<ReflectionFidelityHandler>("Reflection Fidelity Handller");
-    InstallHandler<FreeCamHandler>("Free Cam Handler");
+    //InstallHandler<FreeCamHandler>("Free Cam Handler");
     InstallHandler<ControllerScrollingFixHandler>("Controller Scrolling Fix");
     InstallHandler<CityModelLimitHandler>("City Model Limit Handler"); // Breaks headlights, can be disabled in mc2hook.ini under Experimental
     InstallHandler<LevelExtentsHandler>("Level Extents Handler");
